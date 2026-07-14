@@ -295,6 +295,8 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            group=None,
+            metadata=None,
         )
 
     def test_create_session_passes_model_and_initial_message(self, client):
