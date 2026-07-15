@@ -597,6 +597,22 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     return response.json()
 
 
+def _own_terminal_name(terminal_id: str) -> Optional[str]:
+    """Best-effort lookup of a terminal's own `name` field, for enriching the sender-id
+    injection suffix below with something more readable than a bare terminal id (issue #176 on
+    the harness-control side: a receiving agent had no way to resolve `terminal a1b2c3d4` into
+    anything meaningful). Mirrors `_get_cleanup_nudge`'s own `GET /terminals/{id}` pattern.
+    Never raises -- a lookup failure (terminal deleted mid-flight, transient network issue)
+    degrades to the bare id in the caller, since name enrichment must not block delivery."""
+    try:
+        resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+        resp.raise_for_status()
+        name = resp.json().get("name")
+        return name if isinstance(name, str) and name else None
+    except Exception:
+        return None
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     """Extract a human-readable error detail from an API response."""
     try:
@@ -1091,8 +1107,10 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # address (issue #284); _send_to_inbox raises a clear error for that
         # case anyway.
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
+            own_name = _own_terminal_name(own_terminal_id)
+            sender_label = f'terminal {own_terminal_id} ("{own_name}")' if own_name else f"terminal {own_terminal_id}"
             message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
+                f"\n\n[Message from {sender_label}. "
                 "Use send_message MCP tool for any follow-up work.]"
             )
 

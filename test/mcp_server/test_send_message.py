@@ -59,9 +59,13 @@ class TestSendMessageSenderIdInjection:
     """Tests for sender ID injection in _send_message_impl."""
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._own_terminal_name", return_value=None)
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
-    def test_send_message_appends_sender_id_when_injection_enabled(self, mock_inbox):
-        """When injection is enabled, send_message should append sender ID suffix."""
+    def test_send_message_appends_sender_id_when_injection_enabled(self, mock_inbox, mock_name):
+        """When injection is enabled, send_message should append sender ID suffix. Name lookup
+        mocked to None (e.g. the terminal has no recorded name, or the lookup failed) -- the
+        bare-id fallback shape is covered here; the enriched-with-name shape has its own test
+        below (issue #176)."""
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
         mock_inbox.return_value = {"success": True}
@@ -73,6 +77,42 @@ class TestSendMessageSenderIdInjection:
         assert sent_message.startswith("Here are the results")
         assert "[Message from terminal sender-xyz" in sent_message
         assert "Use send_message MCP tool for any follow-up work.]" in sent_message
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._own_terminal_name", return_value="hc-176-a")
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_send_message_enriches_suffix_with_terminal_name(self, mock_inbox, mock_name):
+        """harness-control#176: when the sending terminal's own `name` is resolvable, the
+        injected suffix includes it -- a receiving agent gets a readable identity, not just an
+        opaque terminal id, without needing the still-unpinned group/metadata/list_siblings work
+        (#432/harness-control#160) at all."""
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender-xyz"}):
+            _send_message_impl("receiver-123", "Here are the results")
+
+        sent_message = mock_inbox.call_args[0][1]
+        assert '[Message from terminal sender-xyz ("hc-176-a")' in sent_message
+        assert "Use send_message MCP tool for any follow-up work.]" in sent_message
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_send_message_name_lookup_failure_degrades_to_bare_id(self, mock_inbox):
+        """A real (unmocked) `_own_terminal_name` call with no reachable CAO API server must not
+        raise or block delivery -- it degrades to the bare-id suffix, same as issue #284's
+        'unknown must never be injected' posture applied to a lookup failure instead of a missing
+        CAO_TERMINAL_ID."""
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender-unreachable"}):
+            _send_message_impl("receiver-123", "Here are the results")
+
+        sent_message = mock_inbox.call_args[0][1]
+        assert "[Message from terminal sender-unreachable. " in sent_message
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
