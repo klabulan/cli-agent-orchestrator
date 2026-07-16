@@ -12,7 +12,7 @@ from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -64,9 +64,26 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = (
-    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
-)
+# harness-control#225: broadened beyond the original arrow-key-navigate footer to also catch the
+# "Enter to confirm · Esc to cancel" footer Ink's Select component renders for a plain
+# numbered/lettered choice -- confirmed live via a real, deterministic repro
+# (CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1, the CLI's own env var for forcing its "Try the new
+# fullscreen renderer?" first-run upsell, found via `strings` on the installed binary; see
+# Tasks/20260716_hc225_onboarding_prompt_visibility/log.md) that this exact footer text is what a
+# brand-new, never-before-seen CLI prompt used, distinct wording from the arrow-navigable case.
+# This is deliberately generic CHROME text, not any one prompt's own wording -- the point is to
+# classify a FUTURE, still-unrecognized choice-type prompt as WAITING_USER_ANSWER too, not just
+# the specific prompts this file happens to already special-case by name below. Nothing here
+# answers the prompt on the operator's behalf (operator's own explicit, binding instruction,
+# harness-control#225: "don't press the question, let it reach the user") -- this only lets
+# initialize() recognize a live, answerable prompt as a legitimate stopping point instead of an
+# indistinguishable-from-broken timeout (see initialize()'s wait_until_status call below), so
+# harness-control's own UI gets a chance to show it to a human instead of CAO tearing the session
+# down first. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below (get_status
+# already did this before this change) so the trust/bypass dialogs -- which this file DOES
+# actively dismiss, in _handle_startup_prompts -- are never reported as WAITING_USER_ANSWER while
+# still unaccepted.
+WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
@@ -466,20 +483,51 @@ class ClaudeCodeProvider(BaseProvider):
         await self._handle_startup_prompts()
 
         # Wait for Claude Code prompt to be ready.
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # Accept IDLE, COMPLETED, and WAITING_USER_ANSWER — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        #
+        # harness-control#225: WAITING_USER_ANSWER added to this accept-set on purpose. Before
+        # this change, ANY interactive choice-type prompt this file doesn't explicitly dismiss
+        # (bypass/trust above) was structurally indistinguishable from a genuinely hung/broken
+        # launch: both left the terminal sitting outside {IDLE, COMPLETED} until init_timeout, at
+        # which point `create_terminal`'s own except-block tore the whole session down
+        # (kill_session, FIFO stop, DB row deleted) -- so the operator never even got a CHANCE to
+        # see and answer it. Confirmed live and 100% reproducible on an unpatched build via
+        # CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1 (see this repo's own
+        # Tasks/20260716_hc225_onboarding_prompt_visibility/log.md). WAITING_USER_ANSWER is CAO's
+        # own existing, positive-evidence-only status (never a default/fallback -- see
+        # get_status()/get_status_from_screen()'s own WAITING_USER_ANSWER_PATTERN check, now
+        # widened above to catch generic Ink confirm/select chrome, not just the arrow-navigable
+        # case), so accepting it here cannot make initialize() return early on a blank/
+        # still-launching terminal the way accepting UNKNOWN would.
         init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
         ):
-            raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
+            # harness-control#225: raise TerminalInputBlockedError, not a bare TimeoutError --
+            # same message text as before (gateway/init_race_retry.py's own
+            # _TRANSIENT_INIT_TIMEOUT_RE regex-matches this exact wording to decide whether a
+            # SYNCHRONOUS create_session call is worth retrying; changing the wording would
+            # silently break that unrelated mechanism, so it stays byte-identical). The type
+            # change only matters on the deferred-init path (POST /sessions?defer_init=true):
+            # _schedule_deferred_init below specifically catches TerminalInputBlockedError to
+            # leave a terminal alive instead of tearing it down. This is the general fallback for
+            # a prompt shape not even caught by the widened WAITING_USER_ANSWER_PATTERN above (a
+            # still-unrecognized future CLI screen) -- the terminal was confirmed alive and
+            # producing output the whole time (wait_for_shell already succeeded, and
+            # _handle_startup_prompts's own polling loop only exits once real, non-empty output is
+            # seen), so a timeout at THIS specific point means "showing something we don't
+            # recognize," not "never started."
+            raise TerminalInputBlockedError(
+                f"Claude Code initialization timed out after {init_timeout}s"
+            )
 
         self._initialized = True
         return True

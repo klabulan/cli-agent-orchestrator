@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
 
@@ -89,7 +89,13 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test initialization timeout when no Claude markers appear."""
+        """Test initialization timeout when no Claude markers appear.
+
+        harness-control#225: this now raises TerminalInputBlockedError, not a bare TimeoutError --
+        see initialize()'s own comment on that raise site. The message text is unchanged (still
+        matched by gateway/init_race_retry.py's retry regex), only the exception TYPE changed, so
+        this still needs updating: TerminalInputBlockedError is not a TimeoutError subclass.
+        """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         # Snapshot and loop return the same content → no new Claude markers
@@ -102,7 +108,9 @@ class TestClaudeCodeProviderInitialization:
             patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]),
             patch("cli_agent_orchestrator.providers.claude_code.time.sleep"),
         ):
-            with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+            with pytest.raises(
+                TerminalInputBlockedError, match="Claude Code initialization timed out"
+            ):
                 await provider.initialize()
 
     @pytest.mark.asyncio
@@ -1498,6 +1506,69 @@ class TestClaudeCodeProviderStartupPrompts:
 
         assert result is True
         mock_tmux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
+
+    def test_get_status_waiting_user_answer_generic_confirm_footer(self):
+        """harness-control#225: WAITING_USER_ANSWER_PATTERN broadened beyond the original
+        arrow-key-navigate footer to also catch "Enter to confirm" -- the footer chrome a plain
+        numbered/lettered Ink choice menu renders (confirmed live against the real "Try the new
+        fullscreen renderer?" upsell). This is the GENERAL half of the fix: a future, still-
+        unrecognized choice-type prompt sharing this same generic footer must classify as
+        WAITING_USER_ANSWER too, not UNKNOWN -- see initialize()'s broadened accept-set."""
+        output = (
+            "Some future unrecognized prompt this file has no special case for\n\n"
+            "  ❱ 1. Option one\n    2. Option two\n\n  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_real_fullscreen_upsell_prompt_is_waiting_user_answer(self):
+        """The real, live-captured "Try the new fullscreen renderer?" onboarding upsell (the
+        concrete repro behind harness-control#225) must classify as WAITING_USER_ANSWER, not
+        UNKNOWN -- the exact status initialize()'s wait_until_status call now also accepts as a
+        real, alive, non-failure outcome. Nothing in this file answers the prompt -- see
+        WAITING_USER_ANSWER_PATTERN's own comment for why auto-dismissal was explicitly rejected;
+        this only lets CAO recognize the terminal is alive and blocked on something a human needs
+        to see, not answer it on their behalf."""
+        output = (
+            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_initialize_accepts_waiting_user_answer_status(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """harness-control#225: initialize() must succeed (not raise TimeoutError) when the
+        terminal settles on WAITING_USER_ANSWER -- a genuinely unrecognized-but-alive interactive
+        prompt is a real, legitimate terminal state, not a failed launch. Before this fix, ONLY
+        {IDLE, COMPLETED} were accepted, so this exact scenario always timed out and CAO's own
+        terminal_service.create_terminal tore the session down before the operator ever saw it."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.211"
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = await provider.initialize()
+
+        assert result is True
+        accepted_statuses = mock_wait_status.call_args.args[1]
+        assert accepted_statuses == {
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.WAITING_USER_ANSWER,
+        }
 
 
 class TestClaudeCodeProviderSettings:
