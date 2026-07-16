@@ -448,6 +448,29 @@ class ClaudeCodeProvider(BaseProvider):
             #     submit in one keystroke with no following Enter needed (Ink's Select component
             #     treats a matching digit key as immediate choice+submit).
             #
+            #     Uses send_special_key, NOT send_keys, and this distinction is load-bearing, not
+            #     stylistic -- found live (harness-control#225 round-2, after the first version of
+            #     this fix shipped a keystroke that silently never registered): send_keys() delivers
+            #     via tmux load-buffer + paste-buffer -p (bracketed paste). By the time THIS screen
+            #     renders, Claude Code's full Ink TUI has already taken over the pane (unlike the
+            #     trust/bypass dialogs above, which render before the Ink app's main loop starts and
+            #     so never enable bracketed paste) and does have bracketed paste active -- so a
+            #     paste-buffer-delivered "2" arrives wrapped as a paste EVENT, which Ink's Select
+            #     menu does not treat as a discrete keypress/hotkey the way a real keystroke is
+            #     treated. Confirmed live: `_handle_startup_prompts`'s own log line fired
+            #     ("...dismissing (Not now)"), CAO reported success almost immediately (a SEPARATE
+            #     bug this round also fixed -- the WAITING_USER_ANSWER status this dismiss races
+            #     against had already sticky-latched from the trust dialog's own transition frame,
+            #     see initialize()'s own comment below), yet `tmux capture-pane` on the real terminal
+            #     kept showing the SAME unanswered prompt 60+ seconds later. `send_special_key` goes
+            #     through libtmux's `pane.send_keys(key, enter=False)` -- a direct `tmux send-keys`
+            #     call, not load-buffer/paste-buffer -- so it's injected as a genuine keystroke
+            #     regardless of the pane's own bracketed-paste state, exactly matching how a human
+            #     pressing "2" on a real keyboard would be delivered. Re-verified live after this
+            #     fix: prompt dismissed and terminal reaches real idle within ~1-2s, matching the
+            #     manual (non-CAO) repro this charter's own investigation used to confirm the
+            #     dismissal keystroke against the real CLI binary in the first place.
+            #
             #     This handler is deliberately narrow (matches this one prompt's own text) --
             #     NOT a general "auto-dismiss any 2-option menu" rule, which would silently answer
             #     on the operator's behalf for prompts that might actually need a real decision.
@@ -464,11 +487,7 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Fullscreen-renderer onboarding upsell detected, dismissing (Not now)")
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
-                    get_backend().send_keys,
-                    self.session_name,
-                    self.window_name,
-                    "2",
-                    enter_count=0,
+                    get_backend().send_special_key, self.session_name, self.window_name, "2"
                 )
                 fullscreen_upsell_dismissed = True
                 await asyncio.sleep(1.0)

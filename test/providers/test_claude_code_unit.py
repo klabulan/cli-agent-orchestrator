@@ -4,7 +4,7 @@ import json
 import shlex
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 import pytest
 
@@ -1514,7 +1514,14 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_fullscreen_upsell_prompt_detected_and_dismissed(self, mock_tmux):
         """harness-control#225: the "Try the new fullscreen renderer?" onboarding upsell is
-        auto-dismissed with a bare "2" ("Not now"), confirmed live to need no following Enter."""
+        auto-dismissed with a bare "2" ("Not now"), confirmed live to need no following Enter.
+
+        Round-2 fix (found live): must use send_special_key, NOT send_keys -- send_keys delivers
+        via tmux's load-buffer/paste-buffer (bracketed paste), which Ink's Select menu silently
+        ignores once its own TUI has bracketed paste active (true by the time this screen renders,
+        unlike the pre-Ink-launch trust/bypass dialogs). A first version of this fix shipped with
+        send_keys and the keystroke never registered against the real CLI -- see claude_code.py's
+        own comment on this exact bug for the full live-repro writeup."""
         mock_tmux.get_history.side_effect = [
             "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
             "  Enter to confirm · Esc to cancel",
@@ -1524,10 +1531,8 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(timeout=2.0)
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "2", enter_count=0
-        )
-        mock_tmux.send_special_key.assert_not_called()
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "2")
+        mock_tmux.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1545,10 +1550,11 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(timeout=5.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "2", enter_count=0
-        )
+        mock_tmux.send_keys.assert_not_called()
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Enter"),
+            call("test-session", "window-0", "2"),
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1565,9 +1571,7 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(timeout=5.0)
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "2", enter_count=0
-        )
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "2")
 
     def test_get_status_waiting_user_answer_generic_confirm_footer(self):
         """harness-control#225: WAITING_USER_ANSWER_PATTERN broadened beyond the original
