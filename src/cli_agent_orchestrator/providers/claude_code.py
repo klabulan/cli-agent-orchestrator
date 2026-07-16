@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import asyncio
 import json
 import logging
 import os
@@ -328,7 +329,7 @@ class ClaudeCodeProvider(BaseProvider):
             json.dump(settings, f, indent=2)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
+    async def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
         Claude Code may show up to two prompts during startup:
@@ -339,15 +340,39 @@ class ClaudeCodeProvider(BaseProvider):
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
+
+        harness-control#215: this method is awaited directly from initialize(),
+        which itself runs on cao-server's single asyncio event loop (uvicorn is
+        started with no ``workers=``, so there is exactly one). Every
+        tmux-backed call here (``get_history``/``send_keys``/``send_special_key``)
+        is a blocking subprocess exec, and every sleep used to be a plain
+        ``time.sleep`` — which blocks the WHOLE OS thread, not just this
+        coroutine. Under N concurrent ``POST /sessions`` calls, that froze
+        every other in-flight request (including other terminals' own
+        wait_for_shell/initialize/wait_until_status, and unrelated endpoints
+        like GET /health) for as long as this loop ran, turning N-way-concurrent
+        session creation into a fully serial queue whose wall-clock length
+        scaled with N — live-reproduced: 18 concurrent creates against this
+        exact method clustered at ~56.5s each (vs. ~18-35s at N=6-12, ~18s at
+        N=1), converging on CAO's own 60s provider_init_timeout purely from
+        this self-inflicted queueing, not from Claude Code itself being slow
+        (a plain, CAO-uninvolved `claude --remote-control` launch reached its
+        own equivalent trust-dialog prompt in low single-digit seconds under
+        the identical real host load). All blocking calls are now offloaded to
+        a worker thread via asyncio.to_thread and all sleeps are
+        asyncio.sleep, so this coroutine yields the event loop instead of
+        freezing it.
         """
         if timeout is None:
             timeout = get_server_settings()["startup_prompt_handler_timeout"]
         start_time = time.time()
         bypass_accepted = False
         while time.time() - start_time < timeout:
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -360,14 +385,20 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(
-                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "\x1b[B",
+                    enter_count=0,
                 )
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 bypass_accepted = True
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue  # Trust prompt may follow
 
             # 2) Handle workspace trust prompt
@@ -376,7 +407,9 @@ class ClaudeCodeProvider(BaseProvider):
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 return
 
             # 3) Claude Code fully started — no prompts needed.
@@ -396,7 +429,7 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without prompts")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Startup prompt handler timed out")
 
     async def initialize(self) -> bool:
@@ -417,11 +450,16 @@ class ClaudeCodeProvider(BaseProvider):
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
         # PROCESSING transition past any stale ready latch.
+        # harness-control#215: offloaded to a thread (see _handle_startup_prompts'
+        # own docstring) so this single subprocess exec can't add to the
+        # same event-loop-blocking pileup under concurrent session creation.
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Handle startup prompts (bypass permissions + workspace trust)
-        self._handle_startup_prompts()
+        await self._handle_startup_prompts()
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
