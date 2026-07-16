@@ -64,11 +64,27 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = (
-    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
-)
+# harness-control#225: broadened beyond the original arrow-key-navigate footer to also catch
+# the "Enter to confirm · Esc to cancel" footer Ink's Select component renders for a plain
+# numbered/lettered choice (confirmed live: both the workspace-trust dialog and the "Try the new
+# fullscreen renderer?" onboarding upsell share this exact footer text, distinct wording from the
+# arrow-navigable case). This is deliberately generic chrome text, not any one prompt's own
+# wording -- the whole point is to classify a FUTURE, still-unrecognized choice-type prompt as
+# WAITING_USER_ANSWER too, not just the two/three prompts this file explicitly special-cases
+# elsewhere. See initialize()'s wait_until_status call, which now accepts this status as a
+# successful (not a timed-out) outcome for exactly this reason.
+WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+# harness-control#225: cosmetic, version-gated first-run "what's new" upsell -- Claude Code
+# CLI >= (an as-yet-unidentified version) offers to switch the TUI renderer on a HOME dir whose
+# stored onboarding-version state lags the installed CLI. Auto-dismissed with "Not now" in
+# _handle_startup_prompts (nothing here for the human to decide -- both choices only pick a
+# rendering mode) so it never blocks initialization or reaches the operator. Confirmed live via
+# CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1 (the CLI's own env var for deterministically forcing this
+# screen, found via `strings` on the installed binary) -- see
+# Tasks/20260716_hc225_onboarding_prompt_visibility/log.md for the full repro.
+FULLSCREEN_UPSELL_PROMPT_PATTERN = r"Try the new fullscreen renderer\?"
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -367,6 +383,8 @@ class ClaudeCodeProvider(BaseProvider):
             timeout = get_server_settings()["startup_prompt_handler_timeout"]
         start_time = time.time()
         bypass_accepted = False
+        trust_accepted = False
+        fullscreen_upsell_dismissed = False
         while time.time() - start_time < timeout:
             output = await asyncio.to_thread(
                 get_backend().get_history, self.session_name, self.window_name
@@ -402,7 +420,13 @@ class ClaudeCodeProvider(BaseProvider):
                 continue  # Trust prompt may follow
 
             # 2) Handle workspace trust prompt
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            #    harness-control#225: changed from an unconditional `return` to `continue` (with a
+            #    `trust_accepted` once-only guard, matching `bypass_accepted` above) -- confirmed
+            #    live that the fullscreen-renderer upsell (step 2b below) can render on the frame
+            #    immediately AFTER trust is dismissed, not before. Returning here unconditionally
+            #    would exit this loop before that later prompt is ever seen, leaving it unhandled
+            #    all the way down to wait_until_status()'s own timeout.
+            if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
@@ -410,7 +434,45 @@ class ClaudeCodeProvider(BaseProvider):
                 await asyncio.to_thread(
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
-                return
+                trust_accepted = True
+                await asyncio.sleep(1.0)
+                continue  # The fullscreen-renderer upsell (2b) may follow
+
+            # 2b) Handle the "Try the new fullscreen renderer?" cosmetic onboarding upsell
+            #     (harness-control#225): a version-gated first-run "what's new" prompt offering to
+            #     switch the TUI renderer. Nothing here for a human to decide on the operator's
+            #     behalf -- both choices only pick a rendering mode, neither touches the workspace,
+            #     credentials, or permissions -- so it's dismissed the same way the trust/bypass
+            #     dialogs above are: deterministically, in-code, before it can ever block session
+            #     creation. Sends the bare digit "2" ("Not now"), confirmed live to select and
+            #     submit in one keystroke with no following Enter needed (Ink's Select component
+            #     treats a matching digit key as immediate choice+submit).
+            #
+            #     This handler is deliberately narrow (matches this one prompt's own text) --
+            #     NOT a general "auto-dismiss any 2-option menu" rule, which would silently answer
+            #     on the operator's behalf for prompts that might actually need a real decision.
+            #     For any OTHER prompt this file doesn't (yet) recognize, see the broadened
+            #     WAITING_USER_ANSWER_PATTERN + initialize()'s wait_until_status accept-set below:
+            #     an unrecognized choice-type prompt is left alone (never auto-answered) but no
+            #     longer times out and tears the session down either -- it's surfaced to the real
+            #     operator through harness-control's own UI instead.
+            if not fullscreen_upsell_dismissed and re.search(
+                FULLSCREEN_UPSELL_PROMPT_PATTERN, clean_output
+            ):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Fullscreen-renderer onboarding upsell detected, dismissing (Not now)")
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "2",
+                    enter_count=0,
+                )
+                fullscreen_upsell_dismissed = True
+                await asyncio.sleep(1.0)
+                continue
 
             # 3) Claude Code fully started — no prompts needed.
             #    The version banner is the ONLY reliable "ready" signal here: it
@@ -466,16 +528,39 @@ class ClaudeCodeProvider(BaseProvider):
         await self._handle_startup_prompts()
 
         # Wait for Claude Code prompt to be ready.
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # Accept IDLE, COMPLETED, and WAITING_USER_ANSWER — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        #
+        # harness-control#225: WAITING_USER_ANSWER added to this accept-set on purpose -- the
+        # general, structural half of this fix (2b above only handles the ONE specific prompt
+        # this file has been taught to recognize by name). _handle_startup_prompts already
+        # auto-dismisses every prompt CAO knows about; if a genuinely UNRECOGNIZED interactive
+        # choice-type prompt is still showing by the time this call runs (a future CLI onboarding
+        # step, a permission dialog nobody's written a handler for yet, ...), that is a real,
+        # alive, perfectly legitimate terminal state -- not a failure. Before this change, ANY
+        # such prompt was structurally indistinguishable from a genuinely hung/broken launch: both
+        # left the terminal sitting outside {IDLE, COMPLETED} until init_timeout, at which point
+        # `create_terminal`'s own except-block tore the whole session down (kill_session, FIFO
+        # stop, DB row deleted) -- so the operator never even got a CHANCE to see and answer it,
+        # confirmed live and 100% reproducible on an unpatched build (see this repo's own
+        # Tasks/20260716_hc225_onboarding_prompt_visibility/log.md). WAITING_USER_ANSWER is CAO's
+        # own existing, positive-evidence-only status (never a default/fallback -- see
+        # get_status()/get_status_from_screen()'s own WAITING_USER_ANSWER_PATTERN check), so
+        # accepting it here cannot make initialize() return early on a blank/still-launching
+        # terminal the way accepting UNKNOWN would. The caller (harness-control's own gateway)
+        # already promotes a session the instant this call returns without inspecting its status
+        # any further -- the operator's own UI is what renders and lets them answer whatever is
+        # actually on screen from there (frontend/src/screenSnapshot.ts's existing generic
+        # numbered-menu parser, already used for the pre-conversation trust dialog/theme picker
+        # case -- this is structurally the same case, not a new one).
         init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
         ):

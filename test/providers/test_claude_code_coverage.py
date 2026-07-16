@@ -95,7 +95,14 @@ class TestHandleStartupPromptsBranches:
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, exit\n"
         )
-        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
+        # harness-control#225: trust handling now continues polling after dismissal (a later,
+        # still-unrecognized prompt -- e.g. the fullscreen-renderer upsell -- can follow it live)
+        # instead of returning immediately, so a third, post-dismissal frame is needed here too.
+        mock_backend.get_history.side_effect = [
+            echoed_launch_cmd,
+            trust_frame,
+            "Welcome to Claude Code v2.5.0",
+        ]
 
         await provider._handle_startup_prompts(timeout=5.0)
 

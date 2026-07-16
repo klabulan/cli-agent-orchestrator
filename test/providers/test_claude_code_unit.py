@@ -1368,9 +1368,14 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
-        mock_tmux.get_history.return_value = (
-            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
-        )
+        # harness-control#225: trust dialog handling now `continue`s instead of returning
+        # immediately (a later, still-unrecognized prompt may follow it -- see the
+        # fullscreen-upsell tests below), so a follow-up "started cleanly" frame is needed for
+        # the loop to actually exit before its own timeout.
+        mock_tmux.get_history.side_effect = [
+            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n",
+            "Welcome to Claude Code v2.1.0",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(timeout=2.0)
@@ -1409,6 +1414,7 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.0",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1438,10 +1444,13 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
         """Test that bypass prompt is handled, then trust prompt follows."""
-        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed); Poll 3: started
+        # cleanly (harness-control#225: trust handling now continues polling instead of returning
+        # immediately, since the fullscreen-upsell prompt can follow it live).
         mock_tmux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.0",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1491,13 +1500,135 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
+        # harness-control#225: trust handling now continues polling after dismissal instead of
+        # returning immediately, so a follow-up "started cleanly" frame is needed to end the loop.
+        mock_tmux.get_history.side_effect = ["", trust_output, "Welcome to Claude Code v2.1.74"]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             result = await provider.initialize()
 
         assert result is True
         mock_tmux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_fullscreen_upsell_prompt_detected_and_dismissed(self, mock_tmux):
+        """harness-control#225: the "Try the new fullscreen renderer?" onboarding upsell is
+        auto-dismissed with a bare "2" ("Not now"), confirmed live to need no following Enter."""
+        mock_tmux.get_history.side_effect = [
+            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel",
+            "Welcome to Claude Code v2.1.211",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(timeout=2.0)
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session", "window-0", "2", enter_count=0
+        )
+        mock_tmux.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_trust_then_fullscreen_upsell_prompt(self, mock_tmux):
+        """harness-control#225: live-confirmed ordering -- the fullscreen-renderer upsell renders
+        on the frame immediately AFTER the trust dialog is dismissed, not before or alongside it.
+        Both must be handled across the same _handle_startup_prompts call."""
+        mock_tmux.get_history.side_effect = [
+            "❯ 1. Yes, I trust this folder\n  2. No",
+            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel",
+            "Welcome to Claude Code v2.1.211",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(timeout=5.0)
+
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session", "window-0", "2", enter_count=0
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_fullscreen_upsell_only_dismissed_once(self, mock_tmux):
+        """The dismissal guard (`fullscreen_upsell_dismissed`) must stop a second "2" from being
+        sent if the prompt's text lingers in the rolling buffer on a later poll, mirroring the
+        existing `bypass_accepted`/`trust_accepted` once-only guards."""
+        upsell = (
+            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel"
+        )
+        mock_tmux.get_history.side_effect = [upsell, upsell, "Welcome to Claude Code v2.1.211"]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(timeout=5.0)
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session", "window-0", "2", enter_count=0
+        )
+
+    def test_get_status_waiting_user_answer_generic_confirm_footer(self):
+        """harness-control#225: WAITING_USER_ANSWER_PATTERN broadened beyond the original
+        arrow-key-navigate footer to also catch "Enter to confirm" -- the footer chrome a plain
+        numbered/lettered Ink choice menu renders (confirmed live against the real "Try the new
+        fullscreen renderer?" upsell). This is the GENERAL half of the fix: a future, still-
+        unrecognized choice-type prompt sharing this same generic footer must classify as
+        WAITING_USER_ANSWER too, not UNKNOWN -- see initialize()'s broadened accept-set."""
+        output = (
+            "Some future unrecognized prompt this file has no special case for\n\n"
+            "  ❱ 1. Option one\n    2. Option two\n\n  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_fullscreen_upsell_is_waiting_user_answer_if_not_yet_dismissed(self):
+        """Defense in depth for initialize()'s broadened accept-set: if the fullscreen-upsell
+        prompt is somehow still on screen when get_status is polled (e.g. _handle_startup_prompts'
+        own dismissal hasn't landed yet), it must classify as WAITING_USER_ANSWER, not UNKNOWN --
+        the exact status initialize()'s wait_until_status call now also accepts as a real, alive,
+        non-failure outcome."""
+        output = (
+            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "  Enter to confirm · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_initialize_accepts_waiting_user_answer_status(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """harness-control#225: initialize() must succeed (not raise TimeoutError) when the
+        terminal settles on WAITING_USER_ANSWER -- a genuinely unrecognized-but-alive interactive
+        prompt is a real, legitimate terminal state, not a failed launch. Before this fix, ONLY
+        {IDLE, COMPLETED} were accepted, so this exact scenario always timed out and CAO's own
+        terminal_service.create_terminal tore the session down before the operator ever saw it."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.211"
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = await provider.initialize()
+
+        assert result is True
+        accepted_statuses = mock_wait_status.call_args.args[1]
+        assert accepted_statuses == {
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.WAITING_USER_ANSWER,
+        }
 
 
 class TestClaudeCodeProviderSettings:
