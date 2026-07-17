@@ -112,7 +112,20 @@ class TestTemplatePackagingParity:
     def test_base_harness_template_source_exists(self):
         assert (TEMPLATES_DIR / "base-harness-template.md").is_file()
 
-    @pytest.mark.parametrize("name", ["developer", "general-purpose"])
+    # Every built-in profile now extends the base template (operator directive,
+    # 2026-07-17): applied universally, no per-profile/per-task-type selection --
+    # diversification into specialized templates is a deliberately separate,
+    # later step.
+    EXTENDING_PROFILES = [
+        "developer",
+        "general-purpose",
+        "reviewer",
+        "code_supervisor",
+        "workflow_scout",
+        "memory_manager",
+    ]
+
+    @pytest.mark.parametrize("name", EXTENDING_PROFILES)
     def test_rendered_profile_matches_checked_in_copy(self, name):
         rendered = render_mod._render_all()
         assert name in rendered, f"{name}.md fragment missing an 'extends' key or missing entirely."
@@ -121,24 +134,34 @@ class TestTemplatePackagingParity:
             f"agent_store/{name}.md has drifted from its templates. Run `{RENDER_COMMAND}`."
         )
 
-    @pytest.mark.parametrize("name", ["developer", "general-purpose"])
+    @pytest.mark.parametrize("name", EXTENDING_PROFILES)
     def test_rendered_profile_carries_the_send_message_warning(self, name):
         rendered = render_mod._render_all()
         assert "mcp__cao-mcp-server__send_message" in rendered[name]
         assert "native `SendMessage`" in rendered[name]
 
-    @pytest.mark.parametrize("name", ["developer", "general-purpose"])
+    @pytest.mark.parametrize("name", EXTENDING_PROFILES)
     def test_rendered_profile_parses_and_has_mcp_server(self, name):
         rendered = render_mod._render_all()
         parsed = parse_agent_profile_text(rendered[name], name)
         assert parsed.name == name
         assert parsed.mcpServers and "cao-mcp-server" in parsed.mcpServers
 
-    def test_developer_and_general_purpose_do_not_duplicate_shared_text_in_their_own_fragments(self):
+    def test_every_extending_profile_exists_as_a_fragment(self):
+        assert set(self.EXTENDING_PROFILES) == set(render_mod._render_all().keys())
+
+    @pytest.mark.parametrize("name", EXTENDING_PROFILES)
+    def test_fragment_does_not_duplicate_shared_base_text(self, name):
         """The source fragments (not the rendered output) must not restate the
         shared base content verbatim -- that's the actual "no duplication" claim."""
-        developer_fragment = (TEMPLATES_DIR / "developer.md").read_text(encoding="utf-8")
-        general_purpose_fragment = (TEMPLATES_DIR / "general-purpose.md").read_text(encoding="utf-8")
-        for fragment_text in (developer_fragment, general_purpose_fragment):
-            assert "mcp__cao-mcp-server__send_message" not in fragment_text
-            assert "list_siblings" not in fragment_text
+        fragment_text = (TEMPLATES_DIR / f"{name}.md").read_text(encoding="utf-8")
+        assert "mcp__cao-mcp-server__send_message" not in fragment_text
+        assert "list_siblings" not in fragment_text
+
+    def test_memory_manager_overrides_the_memory_store_instruction(self):
+        """memory_manager's real job conflicts with the base template's generic
+        'always memory_store' guidance (rule: curation only, never store on its
+        own initiative) -- its fragment must explicitly override that, not
+        silently inherit a contradiction."""
+        rendered = render_mod._render_all()["memory_manager"]
+        assert "must NOT use `memory_store`" in rendered
