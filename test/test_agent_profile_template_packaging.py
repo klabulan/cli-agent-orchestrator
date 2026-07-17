@@ -141,6 +141,18 @@ class TestTemplatePackagingParity:
         assert "native `SendMessage`" in rendered[name]
 
     @pytest.mark.parametrize("name", EXTENDING_PROFILES)
+    def test_rendered_profile_carries_the_ask_your_dispatcher_guidance(self, name):
+        rendered = render_mod._render_all()
+        assert "If a question comes up while you're working" in rendered[name]
+        # Both the default-to-asking rule AND the explicit-instruction-wins escape
+        # hatch must survive composition, not just one or the other.
+        assert "send the question to whoever dispatched you" in rendered[name]
+        assert "an explicit instruction in the task always wins over it" in rendered[name]
+        # The Handoff/Assign split matters here specifically -- Handoff's dispatcher
+        # is synchronously blocked and can't receive a mid-task message at all.
+        assert "no one listening" in rendered[name]
+
+    @pytest.mark.parametrize("name", EXTENDING_PROFILES)
     def test_rendered_profile_parses_and_has_mcp_server(self, name):
         rendered = render_mod._render_all()
         parsed = parse_agent_profile_text(rendered[name], name)

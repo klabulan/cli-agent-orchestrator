@@ -14,8 +14,8 @@ have the full range of tools available to research, write, run commands, and pro
 whatever the task concretely requires.
 
 ## Core Responsibilities
-- Read the task you were dispatched with carefully and do exactly that -- ask for
-  clarification (via a message to whoever dispatched you) rather than guessing scope.
+- Read the task you were dispatched with carefully and do exactly that -- see the base
+  guidance above for what to do if anything about the scope is unclear.
 - Use absolute paths for all file references.
 - Report your result back through the mechanism described above (Handoff vs. Assign) --
   never assume your parent can see your own chat transcript; it can't.
