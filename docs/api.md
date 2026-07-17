@@ -77,6 +77,21 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   server setting, 32KB by default, see [Configuration](configuration.md)),
   not unbounded scrollback. Long sessions are truncated to the tail; use the
   on-disk terminal log for complete history.
+- `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
+  session's initial terminal into peer discovery (a mid-session worker uses
+  `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
+  `group` is an ordered, general-to-specific array (e.g.
+  `["tenant_1", "project_5"]`); `metadata` is a free-form JSON object the
+  running agent updates via the `update_metadata` MCP tool. Both PATCH
+  endpoints are whole-value replace, not merge, last-write-wins under
+  concurrent calls, and reject an omitted field with `422` (an explicit
+  `null`/`[]`/`{}` clears the value; omitting it does not).
+- `GET /terminals/{terminal_id}/siblings` lists other terminals sharing a
+  leading prefix of `terminal_id`'s own `group`, optionally narrowed by
+  `depth`; a caller can never see a wider scope than its own group, and a
+  terminal with no `group` set finds no siblings. Sibling `metadata` is
+  agent-authored, untrusted content — same trust domain as an inbound
+  `send_message` body.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
