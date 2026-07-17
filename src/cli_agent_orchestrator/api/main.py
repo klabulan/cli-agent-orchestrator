@@ -2112,6 +2112,9 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Filter to only this sender terminal's messages"
+    ),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -2119,6 +2122,9 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        sender_id: Optional filter to only messages from this sender (harness-control#240:
+            "has X ever messaged Y" -- combine with limit=1 rather than fetching a bulk,
+            unpaginated window and hoping the message in question is inside it)
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -2136,7 +2142,9 @@ async def get_inbox_messages_endpoint(
                 )
 
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        messages = get_inbox_messages(
+            terminal_id, limit=limit, status=status_filter, sender_id=sender_id
+        )
 
         # Convert to response format
         result = []

@@ -92,7 +92,7 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 2
-            mock_get.assert_called_once_with("abcdef12", limit=2, status=None)
+            mock_get.assert_called_once_with("abcdef12", limit=2, status=None, sender_id=None)
 
     def test_get_messages_with_status_and_limit(self, client, sample_inbox_messages):
         """Test getting messages with both status and limit parameters."""
@@ -104,7 +104,36 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 1
-            mock_get.assert_called_once_with("abcdef12", limit=5, status=MessageStatus.PENDING)
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=5, status=MessageStatus.PENDING, sender_id=None
+            )
+
+    def test_get_messages_with_sender_id_filter(self, client, sample_inbox_messages):
+        """harness-control#240: filter to a specific sender's messages only."""
+        sender1_messages = [msg for msg in sample_inbox_messages if msg.sender_id == "sender1"]
+
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = sender1_messages
+
+            response = client.get("/terminals/abcdef12/inbox/messages?sender_id=sender1")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data) == 1
+            assert data[0]["sender_id"] == "sender1"
+            mock_get.assert_called_once_with("abcdef12", limit=10, status=None, sender_id="sender1")
+
+    def test_get_messages_with_sender_id_and_limit_for_existence_check(self, client):
+        """The harness-control#240 use case: limit=1 + sender_id answers "has X ever
+        messaged Y" with one row fetched, not a bulk unpaginated window."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = []
+
+            response = client.get("/terminals/abcdef12/inbox/messages?sender_id=ghost&limit=1")
+
+            assert response.status_code == 200
+            assert response.json() == []
+            mock_get.assert_called_once_with("abcdef12", limit=1, status=None, sender_id="ghost")
 
     def test_invalid_status_parameter(self, client):
         """Test error handling for invalid status parameter."""
