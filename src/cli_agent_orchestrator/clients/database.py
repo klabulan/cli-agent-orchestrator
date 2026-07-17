@@ -854,14 +854,23 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status/sender filters, ordered by created_at ASC
+    (oldest first).
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter to only this sender's messages (harness-control#240 --
+            answers "has X ever messaged Y" directly, without the caller needing to guess
+            how large `limit` must be to see far enough back in an oldest-first, unpaginated
+            list; a caller that only cares about existence should pass this plus `limit=1`
+            rather than fetching a bulk window and hoping the message they care about is in it)
 
     Returns:
         List of inbox messages ordered by creation time (oldest first)
@@ -871,6 +880,9 @@ def get_inbox_messages(
 
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
+
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
 

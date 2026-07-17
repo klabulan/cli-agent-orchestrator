@@ -843,6 +843,45 @@ class TestInboxOperations:
 
         mock_session.commit.assert_called_once()
 
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_inbox_messages_filters_by_sender_id(self, mock_session_class):
+        """harness-control#240: sender_id, when given, adds its own filter() call so
+        callers can ask "has X ever messaged Y" directly instead of guessing how large
+        `limit` needs to be in an oldest-first, unpaginated result set."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_session.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.order_by.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.all.return_value = []
+        mock_session_class.return_value = mock_session
+
+        get_inbox_messages("receiver-1", limit=1, sender_id="sender-1")
+
+        # receiver_id filter + sender_id filter -- two filter() calls, not one.
+        assert mock_query.filter.call_count == 2
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_inbox_messages_no_sender_filter_when_omitted(self, mock_session_class):
+        """Backward compatibility: omitting sender_id must not add a second filter() call."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_session.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.order_by.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.all.return_value = []
+        mock_session_class.return_value = mock_session
+
+        get_inbox_messages("receiver-1", limit=10)
+
+        assert mock_query.filter.call_count == 1
+
 
 class TestFlowOperations:
     """Tests for flow database operations."""
