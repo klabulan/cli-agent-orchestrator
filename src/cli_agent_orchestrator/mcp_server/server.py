@@ -1364,7 +1364,6 @@ async def update_metadata(
 def _create_sibling_session_impl(
     agent_profile: str,
     initial_message: Optional[str],
-    working_directory: Optional[str],
     group: Optional[List[str]],
     timeout: int,
 ) -> Dict[str, Any]:
@@ -1379,6 +1378,32 @@ def _create_sibling_session_impl(
     always, for a real running agent — unconditionally created a new terminal
     IN THE CALLER'S OWN session with ``caller_id`` set to the caller, making a
     true, caller_id-less peer unreachable from inside a terminal).
+
+    No ``working_directory`` parameter (independent-ROAST finding, round 2,
+    harness-control#303): this always inherits the CALLER's own current
+    working_directory, with no override. A caller-supplied path would go
+    straight to CAO's own ``POST /sessions`` with no validation at all — CAO
+    itself has no tenant concept, and this tool has no access to a consuming
+    product's own workspace/tenant-to-path mapping (a different process/repo
+    for harness-control specifically — ``gateway/workdir.py``'s own
+    ``workspace_root()``/``resolve_within_root``, which this tool cannot call
+    into). Unlike ``group`` (an opaque discovery label this tool CAN safely
+    bound by requiring the same leading element as the caller's own), a
+    filesystem path has no such self-contained, tenant-agnostic containment
+    check available here — building one correctly needs read access to the
+    consuming product's own tenant/path mapping, a real design question, not
+    a one-line fix. Landing an unvalidated absolute path unconditionally on
+    ``POST /sessions`` would give an agent real filesystem read/write
+    wherever that path resolves, categorically worse than the ``group``
+    finding's discovery-only reach — so this stays inherited-only until that
+    design work happens, rather than shipping a heuristic under pressure that
+    might not actually hold across every consumer's own directory layout.
+    ``assign``/``handoff`` accept a ``working_directory`` override too, but
+    behind ``CAO_ENABLE_WORKING_DIRECTORY`` (default off) AND for a
+    fundamentally lower-stakes case: their worker stays a supervised child of
+    the caller. This tool's whole point is an UNSUPERVISED, independent
+    session — same input, larger blast radius — so it does not reuse that
+    flag or that precedent.
     """
     # Inline (not _own_terminal_id_or_error) so the failure shape matches this
     # tool's own {success, terminal_id, message} contract -- same convention
@@ -1411,22 +1436,23 @@ def _create_sibling_session_impl(
 
     # working_directory lives on a separate endpoint, not the Terminal model
     # itself (see get_terminal_working_directory) — same split _create_terminal
-    # already works around for assign/handoff.
-    effective_working_directory = working_directory
-    if effective_working_directory is None:
-        try:
-            wd_response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}/working-directory",
-                timeout=_mcp_timeout(),
-            )
-            if wd_response.status_code == 200:
-                effective_working_directory = wd_response.json().get("working_directory")
-        except Exception:
-            # Non-fatal: fall through with no working_directory override: the
-            # new session then lands wherever cao-server's own default is,
-            # same degraded behavior _create_terminal already accepts for its
-            # analogous lookup.
-            pass
+    # already works around for assign/handoff. Always the caller's own -- no
+    # override parameter exists on this tool (see this function's own
+    # docstring for why).
+    effective_working_directory = None
+    try:
+        wd_response = requests.get(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}/working-directory",
+            timeout=_mcp_timeout(),
+        )
+        if wd_response.status_code == 200:
+            effective_working_directory = wd_response.json().get("working_directory")
+    except Exception:
+        # Non-fatal: fall through with no working_directory set at all: the
+        # new session then lands wherever cao-server's own default is, same
+        # degraded behavior _create_terminal already accepts for its
+        # analogous lookup.
+        pass
 
     # None (not passed) means "inherit mine"; an explicit [] means "opt this
     # sibling out of group-based discovery entirely" — both distinct from
@@ -1540,16 +1566,6 @@ async def create_sibling_session(
             "provider finishes initializing."
         ),
     ),
-    working_directory: Optional[str] = Field(
-        default=None,
-        description=(
-            "Working directory for the new session. Omit to inherit your own — the "
-            "sibling then starts in the same folder/project as you (the common case). "
-            "Pass an explicit path to place it elsewhere instead; no access control is "
-            "enforced on this — the caller is trusted with the path it supplies, same as "
-            "every other CAO tool that accepts one."
-        ),
-    ),
     group: Optional[List[str]] = Field(
         default=None,
         description=(
@@ -1580,18 +1596,18 @@ async def create_sibling_session(
     will not automatically receive its results (use send_message / list_siblings for
     that, exactly as with any other peer you didn't create yourself).
 
-    By default the sibling inherits your own working_directory and group, landing in the
-    same folder/project as you (the common "spin up a peer to help me" case). Override
-    working_directory/group to place it elsewhere within your own tenant — see their own
-    descriptions; a group override that crosses your own tenant boundary is rejected.
+    The sibling always inherits your own working_directory — there is no override
+    parameter for it (a filesystem path has no safe, self-contained tenant-boundary
+    check available to this tool; see the implementation's own docstring). `group` can
+    be overridden to place it under a different project/folder within your own tenant
+    only — see its own description; a group override that crosses your own tenant
+    boundary is rejected.
 
     This call blocks until the new session's CLI provider finishes initializing (the
     same cost as any other new session create — can take up to `timeout` seconds under
     load, since the new-session path has no deferred-init mode to fall back to).
     """
-    return _create_sibling_session_impl(
-        agent_profile, initial_message, working_directory, group, timeout
-    )
+    return _create_sibling_session_impl(agent_profile, initial_message, group, timeout)
 
 
 # =============================================================================

@@ -8,6 +8,13 @@ that reaches the new-session branch (``POST /sessions``, which never accepts or
 sets ``caller_id``) from inside a running terminal. ``create_sibling_session``
 closes that gap: it always calls ``POST /sessions`` directly, so the result is a
 genuine peer, never a child.
+
+No ``working_directory`` parameter exists on this tool (independent-ROAST finding,
+round 2): a caller-supplied path would go straight to CAO's own ``POST /sessions``
+with no tenant-boundary validation available to this tool (unlike ``group``, a
+filesystem path has no self-contained containment check this tool can perform --
+see ``_create_sibling_session_impl``'s own docstring). The sibling always inherits
+the caller's own current working_directory.
 """
 
 import os
@@ -35,9 +42,7 @@ class TestCreateSiblingSessionImpl:
             "cli_agent_orchestrator.mcp_server.server.requests.post"
         ) as mock_post:
             with patch.dict(os.environ, {}, clear=True):
-                result = _create_sibling_session_impl(
-                    "developer", None, None, None, 200
-                )
+                result = _create_sibling_session_impl("developer", None, None, 200)
 
         assert result["success"] is False
         assert "CAO_TERMINAL_ID not set" in result["message"]
@@ -68,7 +73,7 @@ class TestCreateSiblingSessionImpl:
         mock_post.return_value = create_resp
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            result = _create_sibling_session_impl("developer", None, None, None, 200)
+            result = _create_sibling_session_impl("developer", None, None, 200)
 
         assert result["success"] is True
         assert result["terminal_id"] == "sib-123"
@@ -80,45 +85,23 @@ class TestCreateSiblingSessionImpl:
         assert call.args[0] == "http://127.0.0.1:9889/sessions"
         params = call.kwargs["params"]
         assert params["agent_profile"] == "developer"
+        # working_directory is ALWAYS the caller's own -- there is no override
+        # parameter on this tool at all (see module docstring).
         assert params["working_directory"] == "/repo/project5/folder12"
         # The whole point of #303: no caller_id anywhere in the request.
         assert "caller_id" not in params
         assert call.kwargs["json"] == {"group": ["tenant_1", "project_5", "folder_12"]}
 
-    @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
-    def test_explicit_working_directory_and_group_override_inherited_ones(
-        self, mock_get, mock_post
-    ):
-        own_terminal_resp = MagicMock()
-        own_terminal_resp.raise_for_status.return_value = None
-        own_terminal_resp.json.return_value = _own_terminal_response()
-        mock_get.return_value = own_terminal_resp
+    def test_working_directory_is_not_an_accepted_parameter(self):
+        """Security regression guard (independent-ROAST finding, round 2, harness-control#303):
+        this tool must not accept a caller-supplied working_directory at all -- confirmed by
+        calling it with the pre-fix argument shape and asserting a TypeError, not just checking
+        behavior. A future edit that silently reintroduces the parameter (e.g. merging an old
+        branch) would break this loudly rather than silently reopening the escalation."""
+        import inspect
 
-        create_resp = MagicMock()
-        create_resp.raise_for_status.return_value = None
-        create_resp.json.return_value = {"id": "sib-456", "session_name": "cao-sib-2"}
-        mock_post.return_value = create_resp
-
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            result = _create_sibling_session_impl(
-                "analyst",
-                None,
-                "/repo/other-project",
-                ["tenant_1", "project_9"],
-                200,
-            )
-
-        assert result["success"] is True
-        # working_directory was supplied explicitly, so the working-directory
-        # GET for the caller's own cwd must never fire -- only the own-terminal
-        # lookup (plus _get_cleanup_nudge's own unrelated GET in the success
-        # message, same as _assign_impl's success path already does).
-        get_urls = [call.args[0] for call in mock_get.call_args_list]
-        assert "http://127.0.0.1:9889/terminals/caller-abc/working-directory" not in get_urls
-        params = mock_post.call_args.kwargs["params"]
-        assert params["working_directory"] == "/repo/other-project"
-        assert mock_post.call_args.kwargs["json"] == {"group": ["tenant_1", "project_9"]}
+        sig = inspect.signature(_create_sibling_session_impl)
+        assert "working_directory" not in sig.parameters
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
     @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
@@ -137,7 +120,7 @@ class TestCreateSiblingSessionImpl:
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
             result = _create_sibling_session_impl(
-                "developer", None, "/repo/x", ["tenant_2", "project_1"], 200
+                "developer", None, ["tenant_2", "project_1"], 200
             )
 
         assert result["success"] is False
@@ -155,7 +138,10 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp.json.return_value = _own_terminal_response(
             group=["tenant_1", "project_5", "folder_12"]
         )
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         create_resp = MagicMock()
         create_resp.raise_for_status.return_value = None
@@ -164,7 +150,7 @@ class TestCreateSiblingSessionImpl:
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
             result = _create_sibling_session_impl(
-                "developer", None, "/repo/x", ["tenant_1", "project_9"], 200
+                "developer", None, ["tenant_1", "project_9"], 200
             )
 
         assert result["success"] is True
@@ -182,7 +168,7 @@ class TestCreateSiblingSessionImpl:
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
             result = _create_sibling_session_impl(
-                "developer", None, "/repo/x", ["tenant_1", "project_9"], 200
+                "developer", None, ["tenant_1", "project_9"], 200
             )
 
         assert result["success"] is False
@@ -196,7 +182,10 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
         own_terminal_resp.json.return_value = _own_terminal_response(group=None)
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         create_resp = MagicMock()
         create_resp.raise_for_status.return_value = None
@@ -204,7 +193,7 @@ class TestCreateSiblingSessionImpl:
         mock_post.return_value = create_resp
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            result = _create_sibling_session_impl("developer", None, "/repo/x", [], 200)
+            result = _create_sibling_session_impl("developer", None, [], 200)
 
         assert result["success"] is True
         assert mock_post.call_args.kwargs["json"] == {"group": []}
@@ -215,7 +204,10 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
         own_terminal_resp.json.return_value = _own_terminal_response()
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         create_resp = MagicMock()
         create_resp.raise_for_status.return_value = None
@@ -223,7 +215,7 @@ class TestCreateSiblingSessionImpl:
         mock_post.return_value = create_resp
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            _create_sibling_session_impl("developer", None, "/repo/x", [], 200)
+            _create_sibling_session_impl("developer", None, [], 200)
 
         assert mock_post.call_args.kwargs["json"] == {"group": []}
 
@@ -236,7 +228,10 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
         own_terminal_resp.json.return_value = _own_terminal_response()
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         create_resp = MagicMock()
         create_resp.raise_for_status.return_value = None
@@ -245,7 +240,7 @@ class TestCreateSiblingSessionImpl:
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
             result = _create_sibling_session_impl(
-                "developer", "start working on X", "/repo/x", None, 200
+                "developer", "start working on X", None, 200
             )
 
         assert result["success"] is True
@@ -258,12 +253,15 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
         own_terminal_resp.json.return_value = _own_terminal_response()
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         mock_post.side_effect = requests.Timeout("timed out")
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            result = _create_sibling_session_impl("developer", None, "/repo/x", None, 42)
+            result = _create_sibling_session_impl("developer", None, None, 42)
 
         assert result["success"] is False
         assert "timed out after 42s" in result["message"]
@@ -274,7 +272,10 @@ class TestCreateSiblingSessionImpl:
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
         own_terminal_resp.json.return_value = _own_terminal_response()
-        mock_get.return_value = own_terminal_resp
+        mock_get.side_effect = [
+            own_terminal_resp,
+            MagicMock(status_code=200, json=lambda: {"working_directory": "/repo/x"}),
+        ]
 
         error_response = MagicMock()
         error_response.json.return_value = {"detail": "invalid working_directory"}
@@ -285,7 +286,7 @@ class TestCreateSiblingSessionImpl:
         mock_post.return_value = post_response
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
-            result = _create_sibling_session_impl("developer", None, "/nope", None, 200)
+            result = _create_sibling_session_impl("developer", None, None, 200)
 
         assert result["success"] is False
         assert "invalid working_directory" in result["message"]
