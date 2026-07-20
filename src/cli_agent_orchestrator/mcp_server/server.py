@@ -1431,7 +1431,34 @@ def _create_sibling_session_impl(
     # None (not passed) means "inherit mine"; an explicit [] means "opt this
     # sibling out of group-based discovery entirely" — both distinct from
     # "override with a different group" (AC2: another folder/project).
-    effective_group = own_terminal.get("group") if group is None else group
+    own_group = own_terminal.get("group")
+    if group is not None and group != []:
+        # Independent-ROAST finding (harness-control#303, security angle): an unconstrained
+        # group override would be the first agent-facing tool able to hand an LLM an arbitrary
+        # tenant-discovery scope in one call — harness-control's own convention puts
+        # workspace_id first in this array (gateway/main.py's own `group = [workspace_id,
+        # project_id, folder_id]`), and workspace_id is a small sequential integer
+        # (workspaces_store's own autoincrement PK) that's trivial to guess/iterate. A caller
+        # who could set ANY group would immediately gain list_siblings/send_message reach into
+        # another tenant's sessions -- CAO itself has no concept of "tenant" to stop this, only
+        # harness-control's own convention does, so this tool has to enforce it here. AC2 (issue
+        # #303's own "other folders/projects" ask) only ever asked for a DIFFERENT
+        # project/folder, never a different tenant -- so this still fully satisfies it: only the
+        # leading (tenant/workspace) element is pinned to the caller's own; everything after it
+        # is free to differ.
+        if not own_group or group[0] != own_group[0]:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": (
+                    f"Sibling creation failed: group override {group!r} would cross your own "
+                    f"tenant boundary (your own group is {own_group!r}) — create_sibling_session "
+                    f"can place a sibling under a different project/folder WITHIN your own "
+                    f"tenant, but never under a different tenant's group. Omit group to inherit "
+                    f"yours unchanged, or keep its first element identical to your own."
+                ),
+            }
+    effective_group = own_group if group is None else group
 
     provider = resolve_provider(agent_profile, fallback_provider=own_terminal.get("provider"))
 
@@ -1528,9 +1555,11 @@ async def create_sibling_session(
         description=(
             "Discovery group for list_siblings (see that tool). Omit to inherit your "
             "own group unchanged, so the new session is immediately visible to your own "
-            "list_siblings call and vice versa. Pass an explicit array to place it in a "
-            "different group instead (e.g. a different project/folder's group); pass an "
-            "empty list to opt it out of group discovery entirely."
+            "list_siblings call and vice versa. Pass an explicit array to place it under a "
+            "different project/folder within your OWN tenant instead -- the leading element "
+            "(your tenant/workspace) must match your own group's; a value that doesn't is "
+            "rejected, not silently narrowed. Pass an empty list to opt it out of group "
+            "discovery entirely."
         ),
     ),
     timeout: int = Field(
@@ -1553,7 +1582,8 @@ async def create_sibling_session(
 
     By default the sibling inherits your own working_directory and group, landing in the
     same folder/project as you (the common "spin up a peer to help me" case). Override
-    working_directory/group to place it elsewhere — see their own descriptions.
+    working_directory/group to place it elsewhere within your own tenant — see their own
+    descriptions; a group override that crosses your own tenant boundary is rejected.
 
     This call blocks until the new session's CLI provider finishes initializing (the
     same cost as any other new session create — can take up to `timeout` seconds under

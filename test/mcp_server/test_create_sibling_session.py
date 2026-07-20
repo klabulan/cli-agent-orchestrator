@@ -122,6 +122,95 @@ class TestCreateSiblingSessionImpl:
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
     @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_cross_tenant_group_override_is_rejected(self, mock_get, mock_post):
+        """Security regression guard (independent-ROAST finding, harness-control#303): a group
+        override whose leading (tenant/workspace) element differs from the caller's own must be
+        rejected outright, not silently honored -- otherwise this tool would be the first
+        agent-facing capability able to hand an LLM an arbitrary tenant-discovery scope in one
+        call (list_siblings/send_message would then reach another tenant's sessions)."""
+        own_terminal_resp = MagicMock()
+        own_terminal_resp.raise_for_status.return_value = None
+        own_terminal_resp.json.return_value = _own_terminal_response(
+            group=["tenant_1", "project_5", "folder_12"]
+        )
+        mock_get.return_value = own_terminal_resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            result = _create_sibling_session_impl(
+                "developer", None, "/repo/x", ["tenant_2", "project_1"], 200
+            )
+
+        assert result["success"] is False
+        assert "tenant" in result["message"]
+        mock_post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_same_tenant_group_override_is_allowed(self, mock_get, mock_post):
+        """The positive case for the same guard: AC2 (issue #303's own "other folders/projects"
+        ask) only ever asked for a different project/folder, never a different tenant -- an
+        override that keeps the leading element identical to the caller's own must still work."""
+        own_terminal_resp = MagicMock()
+        own_terminal_resp.raise_for_status.return_value = None
+        own_terminal_resp.json.return_value = _own_terminal_response(
+            group=["tenant_1", "project_5", "folder_12"]
+        )
+        mock_get.return_value = own_terminal_resp
+
+        create_resp = MagicMock()
+        create_resp.raise_for_status.return_value = None
+        create_resp.json.return_value = {"id": "sib-abc", "session_name": "cao-sib-abc"}
+        mock_post.return_value = create_resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            result = _create_sibling_session_impl(
+                "developer", None, "/repo/x", ["tenant_1", "project_9"], 200
+            )
+
+        assert result["success"] is True
+        assert mock_post.call_args.kwargs["json"] == {"group": ["tenant_1", "project_9"]}
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_group_override_rejected_when_caller_has_no_own_group(self, mock_get, mock_post):
+        """No own group means no tenant context to authorize ANY override against -- reject
+        rather than silently trust a caller with nothing of its own to compare to."""
+        own_terminal_resp = MagicMock()
+        own_terminal_resp.raise_for_status.return_value = None
+        own_terminal_resp.json.return_value = _own_terminal_response(group=None)
+        mock_get.return_value = own_terminal_resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            result = _create_sibling_session_impl(
+                "developer", None, "/repo/x", ["tenant_1", "project_9"], 200
+            )
+
+        assert result["success"] is False
+        mock_post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_empty_group_override_allowed_even_with_no_own_group(self, mock_get, mock_post):
+        """An empty-list override (opt out of discovery entirely) never widens access, so it's
+        exempt from the tenant-match guard even when the caller itself has no group."""
+        own_terminal_resp = MagicMock()
+        own_terminal_resp.raise_for_status.return_value = None
+        own_terminal_resp.json.return_value = _own_terminal_response(group=None)
+        mock_get.return_value = own_terminal_resp
+
+        create_resp = MagicMock()
+        create_resp.raise_for_status.return_value = None
+        create_resp.json.return_value = {"id": "sib-abc", "session_name": "cao-sib-abc"}
+        mock_post.return_value = create_resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            result = _create_sibling_session_impl("developer", None, "/repo/x", [], 200)
+
+        assert result["success"] is True
+        assert mock_post.call_args.kwargs["json"] == {"group": []}
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.post")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
     def test_empty_group_override_opts_out_of_discovery(self, mock_get, mock_post):
         own_terminal_resp = MagicMock()
         own_terminal_resp.raise_for_status.return_value = None
