@@ -246,10 +246,12 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
     from the per-profile value) governs the outer deadline instead.
     """
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_extends_deadline_past_settings_default(
-        self, mock_backend, mock_time
+    async def test_passed_outer_timeout_extends_deadline_past_settings_default(
+        self, mock_backend, mock_time, mock_asyncio_sleep
     ):
         """A prompt at t=100 is still handled when outer_timeout=180.
 
@@ -259,23 +261,38 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         ``now >= outer_deadline`` (100 >= 60) would have returned before reaching
         get_history -- so the trust Enter firing is the discriminating signal.
         idle_gap is pinned huge so only the outer cap can end the loop.
+
+        workain/harness-control#225: trust no longer returns immediately (the
+        fullscreen-renderer upsell can follow it) -- a second poll after trust is
+        accepted sees a plain "Welcome to" banner and returns via branch 3.
+        Accepting trust also resets last_prompt_time via its own monotonic() call
+        (matching the pre-existing bypass-prompt branch's identical pattern), so
+        two extra values are needed beyond the original 3.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 0 + 180 = 180
             0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180 (alive), gap 100<1000 -> trust prompt -> handled
+            100.0,  # last_prompt_time reset inside the trust-accept branch
+            105.0,  # iter2 now: 105<180 (alive) -> banner seen -> return
         ]
-        mock_backend.get_history.return_value = "Yes, I trust this folder"
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder",
+            "Welcome to Claude Code",
+        ]
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
-        provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+        await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_called_once()
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_caps_a_wedged_start(self, mock_backend, mock_time):
+    async def test_passed_outer_timeout_caps_a_wedged_start(
+        self, mock_backend, mock_time, mock_asyncio_sleep
+    ):
         """With no prompt ever appearing, the loop exits at the passed outer_timeout.
 
         idle_gap is pinned above outer_timeout so the idle-gap exit can never
@@ -283,7 +300,6 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         """
         import logging
 
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 180
             0.0,  # last_prompt_time = 0
@@ -293,7 +309,7 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         mock_backend.get_history.return_value = "still starting..."
         provider = ClaudeCodeProvider("t1", "sess", "win")
         with patch.object(logging.getLogger(_CC), "warning") as mock_warn:
-            provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+            await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()

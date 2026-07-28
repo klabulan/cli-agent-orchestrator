@@ -1790,32 +1790,40 @@ class TestClaudeCodeProviderYoloRootRegression:
 class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
+    async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux, mock_sleep):
         """Test that trust prompt is detected and auto-accepted."""
         mock_tmux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_not_needed(self, mock_tmux):
+    async def test_handle_startup_prompts_not_needed(self, mock_tmux, mock_sleep):
         """Test early return when Claude Code starts without prompts."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time, mock_settings):
+    async def test_handle_startup_prompts_timeout(
+        self, mock_tmux, mock_time, mock_asyncio_sleep, mock_settings
+    ):
         """Handler gives up gracefully at the outer cap when no prompt ever appears.
 
         should-fix-3: the idle-gap exit does not apply until a first prompt has
@@ -1833,30 +1841,35 @@ class TestClaudeCodeProviderStartupPrompts:
         # iter-2 now (still no prompt -> idle-gap check skipped), iter-3 now
         # (61s >= 60s outer cap -> return).
         mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0, 61.0]
-        mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=20.0)
+        await provider._handle_startup_prompts(idle_gap=20.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
+    async def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
-        mock_tmux.get_history.side_effect = [
-            "",
-            "❯ 1. Yes, I trust this folder\n  2. No",
-        ]
+        trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
+        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        # workain/harness-control#225: trust no longer returns immediately (the
+        # fullscreen-upsell can follow it), so this real (unmocked) idle_gap must be
+        # small enough to keep the test fast while still exceeding the ~2s this
+        # test's own two real asyncio.sleep(1.0) calls (empty-output poll, then the
+        # post-trust-accept sleep) take before the idle-gap check can fire.
+        await provider._handle_startup_prompts(idle_gap=1.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux, mock_sleep):
         """Test that bypass permissions prompt is detected and auto-accepted."""
-        # First poll: bypass prompt; second poll: welcome banner (after dismissal)
+        # First poll: bypass prompt; second poll onward: welcome banner (after dismissal)
         mock_tmux.get_history.side_effect = [
             "WARNING: Claude Code running in Bypass Permissions mode\n"
             "❯ 1. No, exit\n  2. Yes, I accept\n",
@@ -1864,23 +1877,31 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         # Verify Down arrow sent via send_keys and Enter via send_special_key
         mock_tmux.send_keys.assert_called_once()
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_then_trust_prompt(self, mock_tmux):
+    async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
         """Test that bypass prompt is handled, then trust prompt follows."""
-        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        # Poll 1: bypass prompt; Poll 2: trust prompt; Poll 3: welcome banner (so the
+        # loop exits deterministically via branch 3 rather than racing real idle-gap
+        # timing against bypass's own internal 0.5s+1.0s real sleeps before trust is
+        # even polled for -- workain/harness-control#225: trust no longer returns
+        # immediately, so a real idle_gap here would otherwise need to survive
+        # bypass's own timing exactly, which is fragile).
+        trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
         mock_tmux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
-            "❯ 1. Yes, I trust this folder\n  2. No",
+            trust_output,
+            "Welcome to Claude Code",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=1000.0)
 
         # Bypass: send_keys (Down) + send_special_key (Enter)
         # Trust: send_special_key (Enter) — called twice total
@@ -1916,15 +1937,20 @@ class TestClaudeCodeProviderStartupPrompts:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_calls_handle_startup_prompts(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_settings, _
     ):
         """Test that initialize calls _handle_startup_prompts."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        # workain/harness-control#225: trust no longer returns immediately -- a small
+        # real (unmocked) idle_gap keeps this test fast rather than waiting out the
+        # real 20s server-settings default.
+        mock_settings.return_value = {"provider_init_timeout": 60, "startup_prompt_handler_timeout": 1.0}
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
         mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")

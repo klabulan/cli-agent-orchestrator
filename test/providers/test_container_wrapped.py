@@ -184,9 +184,11 @@ def test_status_dead_launch_reports_unknown_not_false_idle(mock_backend):
     assert result not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
 
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
 @patch("cli_agent_orchestrator.providers.claude_code.time")
 @patch(_BACKEND)
-def test_idle_timeout_prompt_handler(mock_backend, mock_time):
+async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_asyncio_sleep):
     """Tasks 3 + 4: the idle gap keeps polling for a LATE dialog inside the outer cap.
 
     A cold containerized start renders dialogs late and in sequence. The bypass
@@ -198,22 +200,29 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     idle_gap/outer_timeout are passed explicitly — the exact values initialize()
     forwards from the per-profile provider_init_timeout — so no settings mock is
     needed and the Task 3<->Task 4 wiring is what is under test.
+
+    workain/harness-control#225: trust no longer returns immediately (the
+    fullscreen-renderer upsell can follow it) -- accepting it resets last_prompt_time
+    via its own monotonic() call (one more value needed), and a 3rd poll (a plain
+    "Welcome to" banner) is needed for a deterministic return afterward.
     """
-    mock_time.sleep = MagicMock()
     mock_time.monotonic.side_effect = [
         0.0,  # outer_deadline = 0 + 180 (per-profile init timeout)
         0.0,  # last_prompt_time = 0
         18.0,  # iter1: gap 18<20 and 18<180 -> bypass handled, timer reset
         18.0,  # last_prompt_time reset to 18
-        35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled -> return
+        35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled, timer reset
+        35.0,  # last_prompt_time reset to 35 (trust's own branch)
+        40.0,  # iter3: gap 40-35=5<20 and 40<180 -> banner seen -> return
     ]
     mock_backend.get_history.side_effect = [
         "WARNING: Bypass Permissions\n1. No\n2. Yes, I accept\n",
         "Yes, I trust this folder",
+        "Welcome to Claude Code",
     ]
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
-    provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
+    await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
     # Bypass: Down arrow (send_keys) + Enter (send_special_key). Trust: Enter.
     assert mock_backend.send_keys.call_count == 1
