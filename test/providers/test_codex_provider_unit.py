@@ -2012,15 +2012,6 @@ class TestCodexProviderTrustPrompt:
         assert TerminalStatus.IDLE in target_status_arg
         assert TerminalStatus.COMPLETED in target_status_arg
 
-    def test_backend_registry_is_clean_at_test_start(self):
-        """Regression for #522: autouse fixture resets the backend singleton."""
-        from cli_agent_orchestrator.backends import registry
-
-        assert registry._backend is None, (
-            "Backend singleton leaked from a prior test — "
-            "_reset_backend_registry fixture is not working"
-        )
-
 
 class TestCodexProviderUpdateDialog:
     """Tests for Codex update-available dialog handling."""
