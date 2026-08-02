@@ -126,20 +126,6 @@ WAITING_USER_ANSWER_PATTERN = (
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
-# harness-control#225 (workain/harness-control): cosmetic, version-gated first-run "what's new"
-# upsell -- Claude Code CLI offers to switch the TUI renderer on a HOME dir whose stored
-# onboarding-version state lags the installed CLI. Auto-dismissed with "Not now" in
-# _handle_startup_prompts (nothing here for a human to decide -- both choices only pick a
-# rendering mode) so it never blocks initialization or reaches the operator. Confirmed live via
-# CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1 (the CLI's own env var for deterministically forcing this
-# screen). Deliberately narrow -- matches this ONE prompt's own text, not a general "auto-dismiss
-# any 2-option menu" rule (see this fork's own carry-forward note in this repo's git history for
-# why the broader WAITING_USER_ANSWER_PATTERN generalization that originally accompanied this fix
-# was NOT carried forward: it would touch this same regex's other, unrelated use in get_status()
-# below, whose own comment already documents a "known residual" false-positive risk on ordinary
-# agent prose -- broadening it needs its own dedicated review, not a side effect of an unrelated
-# rebase).
-FULLSCREEN_UPSELL_PROMPT_PATTERN = r"Try the new fullscreen renderer\?"
 _DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
@@ -464,14 +450,27 @@ class ClaudeCodeProvider(BaseProvider):
         return f"{unset_cmd}; {claude_cmd}"
 
     @staticmethod
-    def _ensure_skip_bypass_prompt_setting() -> None:
-        """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
+    def _ensure_startup_settings() -> None:
+        """Ensure ``~/.claude/settings.json`` has the settings that suppress CLI prompts CAO
+        never wants to see, so the settings-based fix is what prevents them, not runtime
+        detect-and-dismiss.
 
-        Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
-        on every launch with ``--dangerously-skip-permissions`` unless
-        ``skipDangerousModePermissionPrompt: true`` is persisted in
-        ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
-        so the confirmation is redundant and blocks initialization.
+        - ``skipDangerousModePermissionPrompt: true``: Claude Code (v2.1.41+) shows a bypass
+          permissions confirmation dialog on every launch with
+          ``--dangerously-skip-permissions`` unless this is persisted. CAO already uses the
+          flag intentionally, so the confirmation is redundant and blocks initialization.
+        - ``tui: "default"``: Claude Code shows a first-run "Try the new fullscreen renderer?"
+          onboarding upsell (workain/harness-control#225) on a HOME dir whose stored
+          onboarding-version state lags the installed CLI, unless the CLI's own ``/tui``
+          setting is already explicitly set to something (either value -- ``"default"`` or
+          ``"fullscreen"``). ``"default"`` keeps the classic renderer this file's own
+          screen-scraping status detection already expects (get_status/wait_until_status parse
+          raw pane content; the CLI's real fullscreen mode uses the terminal's alternate
+          screen, which is untested against this file's own scraping and not something to
+          switch on as a side effect of dialog suppression). This replaces an earlier
+          runtime detect-and-dismiss approach (regex-matching the exact prompt text, then
+          injecting a keystroke to answer it) -- prevention beats reacting to a shape that
+          only exists at all because this setting was left unset.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
         settings: dict = {}
@@ -482,34 +481,41 @@ class ClaudeCodeProvider(BaseProvider):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if settings.get("skipDangerousModePermissionPrompt") is True:
+        changed = False
+        if settings.get("skipDangerousModePermissionPrompt") is not True:
+            settings["skipDangerousModePermissionPrompt"] = True
+            changed = True
+        if "tui" not in settings:
+            settings["tui"] = "default"
+            changed = True
+
+        if not changed:
             return
 
-        settings["skipDangerousModePermissionPrompt"] = True
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
-        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+        logger.info("Updated startup-prompt-suppressing settings in ~/.claude/settings.json")
 
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
-        Claude Code may show up to three prompts during startup:
+        Claude Code may show up to two prompts during startup:
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
-           The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
+           The settings-based fix (``_ensure_startup_settings``) prevents
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
-        2b. **Fullscreen-renderer onboarding upsell** (workain/harness-control#225) – a
-            cosmetic, version-gated first-run "what's new" prompt ("Try the new fullscreen
-            renderer?"). Dismissed with "Not now" -- see ``FULLSCREEN_UPSELL_PROMPT_PATTERN``'s
-            own comment for why this is safe to auto-answer (neither choice affects the
-            workspace/credentials/permissions) and why it's deliberately narrow rather than a
-            general unrecognized-prompt fallback.
+
+        The first-run "Try the new fullscreen renderer?" onboarding upsell
+        (workain/harness-control#225) is prevented from appearing at all rather than
+        detected-and-dismissed here: ``_ensure_startup_settings`` seeds ``tui: "default"``
+        into ``~/.claude/settings.json`` before launch, and the CLI's own gate for that prompt
+        skips it whenever ``tui`` is already explicitly set to anything.
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -559,7 +565,6 @@ class ClaudeCodeProvider(BaseProvider):
         any_prompt_handled = False
         bypass_accepted = False
         trust_accepted = False
-        fullscreen_upsell_dismissed = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -604,13 +609,6 @@ class ClaudeCodeProvider(BaseProvider):
                 continue
 
             # 2) Handle workspace trust prompt.
-            #    workain/harness-control#225: changed from an unconditional `return` to
-            #    `continue` (with a `trust_accepted` once-only guard, matching
-            #    `bypass_accepted` above) -- confirmed live that the fullscreen-renderer
-            #    upsell (step 2b below) can render on the frame immediately AFTER trust is
-            #    dismissed, not before. Returning here unconditionally would exit this loop
-            #    before that later prompt is ever seen, leaving it unhandled all the way
-            #    down to wait_until_status()'s own timeout.
             if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -620,37 +618,6 @@ class ClaudeCodeProvider(BaseProvider):
                     get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                 )
                 trust_accepted = True
-                any_prompt_handled = True
-                last_prompt_time = time.monotonic()
-                await asyncio.sleep(1.0)
-                continue  # The fullscreen-renderer upsell (2b) may follow
-
-            # 2b) Handle the "Try the new fullscreen renderer?" cosmetic onboarding upsell
-            #     (workain/harness-control#225) -- see FULLSCREEN_UPSELL_PROMPT_PATTERN's own
-            #     comment for the full reasoning. Sends the bare digit "2" ("Not now") via
-            #     send_special_key, NOT send_keys -- load-bearing, not stylistic: by the time
-            #     this screen renders, Claude Code's full Ink TUI has already taken over the
-            #     pane (unlike the trust/bypass dialogs above, which render before the Ink
-            #     app's main loop starts and never enable bracketed paste) and DOES have
-            #     bracketed paste active, so a paste-buffer-delivered "2" (send_keys' own
-            #     delivery mechanism) arrives wrapped as a paste event that Ink's Select menu
-            #     does not treat as a discrete keypress. send_special_key goes through
-            #     libtmux's pane.send_keys(key, enter=False) -- a direct tmux send-keys call,
-            #     not load-buffer/paste-buffer -- injecting the digit as a genuine keystroke
-            #     regardless of the pane's own bracketed-paste state (confirmed live,
-            #     workain/harness-control#225 round 2: the first version of this fix used
-            #     send_keys and the dismiss silently never registered).
-            if not fullscreen_upsell_dismissed and re.search(
-                FULLSCREEN_UPSELL_PROMPT_PATTERN, clean_output
-            ):
-                from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-                logger.info("Fullscreen-renderer onboarding upsell detected, dismissing (Not now)")
-                status_monitor.notify_input_sent(self.terminal_id)
-                await asyncio.to_thread(
-                    get_backend().send_special_key, self.session_name, self.window_name, "2"
-                )
-                fullscreen_upsell_dismissed = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()
                 await asyncio.sleep(1.0)
@@ -694,7 +661,7 @@ class ClaudeCodeProvider(BaseProvider):
         # (~/.claude/settings.json read+write) directly on the event loop this coroutine
         # runs on -- offloaded for the same reason as the calls below, so nothing in
         # initialize() blocks the loop.
-        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
+        await asyncio.to_thread(self._ensure_startup_settings)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)

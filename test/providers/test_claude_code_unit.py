@@ -33,9 +33,9 @@ def cleanup_tmp_files():
             f.unlink(missing_ok=True)
 
 
-# All initialization tests need to patch _ensure_skip_bypass_prompt_setting
+# All initialization tests need to patch _ensure_startup_settings
 # to avoid writing to the real ~/.claude/settings.json.
-_PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+_PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
 
 
 def _extract_mcp_config(command: str) -> dict:
@@ -1855,11 +1855,11 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        # workain/harness-control#225: trust no longer returns immediately (the
-        # fullscreen-upsell can follow it), so this real (unmocked) idle_gap must be
-        # small enough to keep the test fast while still exceeding the ~2s this
-        # test's own two real asyncio.sleep(1.0) calls (empty-output poll, then the
-        # post-trust-accept sleep) take before the idle-gap check can fire.
+        # Trust doesn't return immediately (continues polling in case anything else
+        # follows), so this real (unmocked) idle_gap must be small enough to keep the test
+        # fast while still exceeding the ~2s this test's own two real asyncio.sleep(1.0)
+        # calls (empty-output poll, then the post-trust-accept sleep) take before the
+        # idle-gap check can fire.
         await provider._handle_startup_prompts(idle_gap=1.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
@@ -1965,8 +1965,8 @@ class TestClaudeCodeProviderSettings:
     """Tests for Claude Code settings management."""
 
     @patch("cli_agent_orchestrator.providers.claude_code.Path")
-    def test_ensure_skip_bypass_prompt_already_set(self, mock_path_cls):
-        """Test no-op when setting is already present."""
+    def test_ensure_startup_settings_already_set_is_noop(self, mock_path_cls):
+        """Test no-op when both settings are already present."""
         mock_settings_path = MagicMock()
         mock_settings_path.exists.return_value = True
         mock_path_cls.home.return_value.__truediv__ = MagicMock(
@@ -1979,15 +1979,15 @@ class TestClaudeCodeProviderSettings:
         mock_home.__truediv__ = MagicMock(return_value=mock_claude_dir)
         mock_claude_dir.__truediv__ = MagicMock(return_value=mock_settings_path)
 
-        existing = json.dumps({"skipDangerousModePermissionPrompt": True})
+        existing = json.dumps({"skipDangerousModePermissionPrompt": True, "tui": "default"})
         with patch("builtins.open", mock_open(read_data=existing)):
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         # Should not write (file handle's write not called)
         mock_settings_path.parent.mkdir.assert_not_called()
 
-    def test_ensure_skip_bypass_prompt_writes_setting(self, tmp_path):
-        """Test that setting is written when missing."""
+    def test_ensure_startup_settings_writes_both_when_missing(self, tmp_path):
+        """Test that both settings are written when missing."""
         settings_file = tmp_path / ".claude" / "settings.json"
         settings_file.parent.mkdir(parents=True)
         settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
@@ -1999,14 +1999,15 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+        assert result["tui"] == "default"
         # Original settings preserved
         assert result["permissions"] == {"allow": []}
 
-    def test_ensure_skip_bypass_prompt_creates_file(self, tmp_path):
+    def test_ensure_startup_settings_creates_file(self, tmp_path):
         """Test that settings file is created when it doesn't exist."""
         settings_file = tmp_path / ".claude" / "settings.json"
 
@@ -2017,10 +2018,60 @@ class TestClaudeCodeProviderSettings:
                 return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
             )
 
-            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+            ClaudeCodeProvider._ensure_startup_settings()
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+        assert result["tui"] == "default"
+
+    def test_ensure_startup_settings_adds_tui_without_disturbing_existing_bypass_setting(
+        self, tmp_path
+    ):
+        """workain/harness-control#225: a HOME that already has
+        skipDangerousModePermissionPrompt set (from a prior run) but predates this fix must
+        still get tui seeded on the next run, without re-writing/disturbing the setting
+        that's already correct."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"skipDangerousModePermissionPrompt": True}))
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_startup_settings()
+
+        result = json.loads(settings_file.read_text())
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert result["tui"] == "default"
+
+    def test_ensure_startup_settings_does_not_override_explicit_fullscreen_choice(
+        self, tmp_path
+    ):
+        """A HOME where a human explicitly chose fullscreen mode (e.g. via the CLI's own
+        `/tui fullscreen` command) must not have that choice silently reverted to
+        "default" -- only an ABSENT tui key gets seeded, an explicit one of either value is
+        left alone."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(
+            json.dumps({"skipDangerousModePermissionPrompt": True, "tui": "fullscreen"})
+        )
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_startup_settings()
+
+        result = json.loads(settings_file.read_text())
+        assert result["tui"] == "fullscreen"
 
 
 class TestClaudeCodeMcpCallNotCompleted:
