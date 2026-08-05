@@ -1623,6 +1623,216 @@ async def update_metadata(
     return _update_metadata_impl(metadata)
 
 
+def _create_sibling_session_impl(
+    agent_profile: str,
+    initial_message: Optional[str],
+    group: Optional[List[str]],
+    timeout: int,
+) -> Dict[str, Any]:
+    """Implementation of create_sibling_session logic.
+
+    Unlike ``_create_terminal`` (used by assign/handoff), this ALWAYS takes the
+    new-session path (``POST /sessions``) regardless of whether the caller is
+    running inside an existing terminal -- that endpoint never accepts or sets
+    ``caller_id``, so the resulting terminal is a genuine root, not a child.
+    ``assign``/``handoff`` both create a WORKER terminal via ``_create_terminal``,
+    which -- whenever ``CAO_TERMINAL_ID`` is set (i.e. always, for a real running
+    agent) -- unconditionally takes the existing-session branch and records the
+    caller as ``caller_id``, making the new terminal a subordinate child. There is
+    no other agent-facing path that ever reaches the new-session branch from
+    inside a running terminal, so a true, ``caller_id``-less peer was otherwise
+    unreachable to an agent.
+
+    No ``working_directory`` parameter: this always inherits the CALLER's own
+    current working_directory, with no override. Placing an independent,
+    unsupervised sibling session at an arbitrary caller-supplied path is a much
+    larger blast radius than assign/handoff's own (opt-in,
+    ``CAO_ENABLE_WORKING_DIRECTORY``-gated) override, whose worker stays a
+    supervised child of the caller in the same session. Consumers that need a
+    tenant/access-boundary-aware relocation of a sibling's working directory
+    should enforce that at their own integration layer (e.g. an MCP proxy or
+    dispatch-time hook) before this tool is ever invoked -- this generic tool
+    has no concept of "tenant" and cannot safely validate an arbitrary path on
+    its own.
+    """
+    # Inline (not _own_terminal_id_or_error) so the failure shape matches this
+    # tool's own {success, terminal_id, message} contract -- same convention
+    # _assign_impl already uses, rather than list_siblings/update_metadata's
+    # {success, error} shape.
+    own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not own_terminal_id:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Sibling creation failed: CAO_TERMINAL_ID not set — create_sibling_session "
+                "must run from inside a CAO terminal so it knows whose group/working_directory "
+                "to inherit from."
+            ),
+        }
+
+    try:
+        own_response = requests.get(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+        )
+        own_response.raise_for_status()
+        own_terminal = own_response.json()
+    except Exception as e:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": f"Failed to resolve your own terminal context: {e}",
+        }
+
+    # working_directory lives on a separate endpoint, not the Terminal model
+    # itself (see get_terminal_working_directory) — same split _create_terminal
+    # already works around for assign/handoff. Always the caller's own -- no
+    # override parameter exists on this tool (see this function's own
+    # docstring for why).
+    effective_working_directory = None
+    try:
+        wd_response = requests.get(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}/working-directory",
+            timeout=_mcp_timeout(),
+        )
+        if wd_response.status_code == 200:
+            effective_working_directory = wd_response.json().get("working_directory")
+    except Exception:
+        # Non-fatal: fall through with no working_directory set at all: the
+        # new session then lands wherever cao-server's own default is, same
+        # degraded behavior _create_terminal already accepts for its
+        # analogous lookup.
+        pass
+
+    # None (not passed) means "inherit mine"; an explicit [] means "opt this
+    # sibling out of group-based discovery entirely" — both distinct from
+    # "override with a different group" (a different project/folder within
+    # the same discovery scope).
+    own_group = own_terminal.get("group")
+    effective_group = own_group if group is None else group
+
+    provider = resolve_provider(agent_profile, fallback_provider=own_terminal.get("provider"))
+
+    terminal_id: Optional[str] = None
+    try:
+        params: Dict[str, Any] = {"provider": provider, "agent_profile": agent_profile}
+        if effective_working_directory:
+            params["working_directory"] = effective_working_directory
+        json_body: Dict[str, Any] = {}
+        if effective_group is not None:
+            json_body["group"] = effective_group
+
+        response = requests.post(
+            f"{API_BASE_URL}/sessions",
+            params=params,
+            json=json_body,
+            timeout=float(timeout),
+        )
+        response.raise_for_status()
+        terminal = response.json()
+        terminal_id = terminal["id"]
+
+        delivery_note = ""
+        if initial_message:
+            try:
+                _send_to_inbox(terminal_id, initial_message)
+                delivery_note = " Your initial_message was delivered to its inbox."
+            except Exception as e:
+                delivery_note = (
+                    f" Failed to deliver initial_message ({e}) — use send_message "
+                    f"to '{terminal_id}' to deliver it yourself."
+                )
+
+        return {
+            "success": True,
+            "terminal_id": terminal_id,
+            "session_name": terminal.get("session_name"),
+            "message": (
+                f"Created sibling session (terminal {terminal_id}) as a genuine peer — "
+                f"it has no caller_id, does not report to you, and will not appear as "
+                f"your child anywhere. Use list_siblings to discover it and send_message "
+                f"to reach it." + delivery_note + _get_cleanup_nudge()
+            ),
+        }
+    except requests.Timeout:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": (
+                f"Sibling creation timed out after {timeout}s waiting for its CLI "
+                f"provider to initialize — it may still come up; check list_siblings "
+                f"shortly rather than retrying immediately."
+            ),
+        }
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": f"Failed to create sibling session: {detail}",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": f"Failed to create sibling session: {str(e)}",
+        }
+
+
+@mcp.tool()
+async def create_sibling_session(
+    agent_profile: str = Field(
+        description='Agent profile for the new peer session (e.g., "developer", "analyst")'
+    ),
+    initial_message: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional first message delivered to the new session's inbox once its CLI "
+            "provider finishes initializing."
+        ),
+    ),
+    group: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Discovery group for list_siblings (see that tool). Omit to inherit your "
+            "own group unchanged, so the new session is immediately visible to your own "
+            "list_siblings call and vice versa. Pass an explicit array to place it under a "
+            "different discovery scope instead. Pass an empty list to opt it out of group "
+            "discovery entirely."
+        ),
+    ),
+    timeout: int = Field(
+        default=200,
+        description=(
+            "Seconds to wait for the new session's CLI provider to finish initializing "
+            "before giving up. Session creation is synchronous, unlike assign — there is "
+            "no caller session to attach deferred delivery to."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Create a brand-new, independent CAO session that is a genuine PEER of you — not a subordinate.
+
+    assign and handoff both create a WORKER terminal that reports back to you, recorded
+    as your child via caller_id in the same tmux session. There is no way to reach a true
+    peer through either — this tool is that missing path. The new session has no
+    caller_id at all: it will never appear as your child in any hierarchy view, and you
+    will not automatically receive its results (use send_message / list_siblings for
+    that, exactly as with any other peer you didn't create yourself).
+
+    The sibling always inherits your own working_directory — there is no override
+    parameter for it (see the implementation's own docstring for why). `group` can be
+    overridden to place it under a different discovery scope — see its own description.
+    A consuming product that layers its own access-control model on top of `group` (e.g.
+    a multi-tenant deployment) should validate any override at its own integration layer
+    (this tool has no concept of "tenant" and applies no policy of its own to the value).
+
+    This call blocks until the new session's CLI provider finishes initializing (the
+    same cost as any other new session create — can take up to `timeout` seconds under
+    load, since the new-session path has no deferred-init mode to fall back to).
+    """
+    return _create_sibling_session_impl(agent_profile, initial_message, group, timeout)
+
+
 # =============================================================================
 # Profile Discovery Tools
 # =============================================================================
