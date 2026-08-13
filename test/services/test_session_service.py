@@ -215,14 +215,56 @@ class TestGetSession:
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             get_session("cao-nonexistent")
 
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_get_session_not_in_list(self, mock_get_backend):
-        """Test getting session that exists but not in list."""
-        mock_get_backend.return_value.session_exists.return_value = True
-        mock_get_backend.return_value.list_sessions.return_value = []
+    def test_get_session_confirmed_live_but_absent_from_list_is_not_a_404(
+        self, mock_get_backend, mock_list_terminals, mock_get_status
+    ):
+        """harness-control#840 REGRESSION: a session session_exists() confirms LIVE but that a
+        transient list_sessions() snapshot came back WITHOUT (TmuxClient.list_sessions swallows a
+        transient tmux error to []) must NOT 404. The pre-fix code raised "not found" here -- that
+        spurious "listed but detail 404s" was the exact signal the harness-control gateway read as
+        substrate loss and tore live sessions down on (12 fatal give-ups, 2026-08-13). The session
+        is returned (status synthesized as 'detached'), with its terminals intact."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-        with pytest.raises(ValueError, match="Session 'cao-test' not found"):
-            get_session("cao-test")
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = []  # transient empty snapshot
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-test"}]
+        mock_get_status.return_value = TerminalStatus.PROCESSING
+
+        result = get_session("cao-test")
+
+        # Confirmed-live session is returned, NOT 404'd.
+        assert result["session"]["id"] == "cao-test"
+        assert result["session"]["name"] == "cao-test"
+        assert result["session"]["status"] == "detached"  # synthesized cosmetic default
+        # Terminals are still resolved and status-enriched -- the whole point is a fully usable
+        # detail response, not a degraded stub.
+        assert len(result["terminals"]) == 1
+        assert result["terminals"][0]["status"] == "processing"
+
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_prefers_real_listing_record_when_present(
+        self, mock_get_backend, mock_list_terminals, mock_get_status
+    ):
+        """The #840 synthesis is a fallback ONLY: when the session IS in the listing, its real
+        record (real status etc.) is used, not the synthesized stub."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "cao-test", "status": "active"}
+        ]
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-test"}]
+        mock_get_status.return_value = TerminalStatus.IDLE
+
+        result = get_session("cao-test")
+
+        assert result["session"]["status"] == "active"  # real record, not the synthesized default
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_error(self, mock_get_backend):
