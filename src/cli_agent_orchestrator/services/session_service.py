@@ -125,14 +125,38 @@ def list_sessions() -> List[Dict]:
 def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
     try:
-        if not get_backend().session_exists(session_name):
+        backend = get_backend()
+        # session_exists() is the AUTHORITATIVE existence check. On the tmux
+        # backend it falls back to a direct `tmux has-session` probe when the
+        # listing cannot be parsed (clients/tmux.py::session_exists), so it does
+        # NOT spuriously answer False on a transient. If it says the session is
+        # gone, that is a real 404.
+        if not backend.session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
-        tmux_sessions = get_backend().list_sessions()
-        session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
-
-        if not session_data:
-            raise ValueError(f"Session '{session_name}' not found")
+        # harness-control#840 (the "listed but detail 404s" flap driver, fixed
+        # here at the source). The pre-fix code additionally REQUIRED the session
+        # to appear in a SECOND, independent list_sessions() round trip and 404'd
+        # it otherwise. That is a TOCTOU with a live-session false-negative:
+        # TmuxClient.list_sessions() swallows a transient generic tmux error to
+        # [] (see its own body -- only a parse failure raises; everything else
+        # returns an empty list), so a session that session_exists() *just*
+        # confirmed LIVE could still 404 here purely because this redundant
+        # listing momentarily came back empty -- while GET /sessions, which a
+        # client polls a beat apart, still reported it. Downstream (the
+        # harness-control gateway) read that "listed but detail 404s" as substrate
+        # loss and tore live sessions down on wake (12 fatal give-ups on
+        # 2026-08-13). A session already confirmed to exist is therefore NEVER
+        # 404'd merely for being absent from this one snapshot: use its real
+        # listing record when present, else synthesize a minimal one. status
+        # defaults to "detached" for the synthesized case; it is cosmetic
+        # (attached-clients flag) and the per-terminal status enriched below is
+        # derived independently and is unaffected.
+        session_data = next(
+            (s for s in backend.list_sessions() if s["id"] == session_name), None
+        )
+        if session_data is None:
+            session_data = {"id": session_name, "name": session_name, "status": "detached"}
 
         terminals = list_terminals_by_session(session_name)
         # Enrich each terminal with its live status. list_terminals_by_session
