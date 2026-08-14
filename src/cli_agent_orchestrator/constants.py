@@ -268,6 +268,30 @@ PYTE_QUIESCENCE_DELAY_S = 0.2
 # for capable providers (e.g., Claude Code).
 EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
 
+# --- Reconcile teardown grace (never destroy a live terminal on a transient read) --------
+#
+# The herdr reconcile loop reaps DB rows / kills workspaces for terminals whose
+# tab is gone. Under host load a transient tmux/herdr READ failure ("Window not
+# found", timeout, TmuxLookupError, TerminalNotFoundError) can momentarily look
+# like absence — and treating that failed read as proof of death once destroyed
+# an entire live fleet in 16s (incident 2026-08-14). A read failure is UNKNOWN,
+# never dead: teardown fires ONLY on an AUTHORITATIVE confirmed-absent
+# observation (the tab genuinely gone from a successfully-read `api snapshot`),
+# and only after BOTH a corroboration count AND a wall-clock grace — the
+# two-timer shape mature reconcilers use (Kubernetes --node-monitor-grace-period
+# ≥3 missed heartbeats + a separate, longer tolerationSeconds before eviction).
+#
+# RECONCILE_ABSENT_THRESHOLD: consecutive authoritative confirmed-absent
+#   observations required before teardown (≈ the ≥3-missed-heartbeat rule). A
+#   read that ERRORS is UNKNOWN and does NOT count toward this — only a
+#   successful snapshot in which the tab is genuinely absent advances it.
+# RECONCILE_ABSENT_GRACE_SECONDS: wall-clock a terminal must remain
+#   continuously confirmed-absent before teardown (≈ tolerationSeconds).
+# Both are required (AND). THRESHOLD=1 + GRACE=0 restores the old immediate
+# teardown (used by the regression test to prove the knobs gate behavior).
+RECONCILE_ABSENT_THRESHOLD = _env_int("CAO_RECONCILE_ABSENT_THRESHOLD", 3)
+RECONCILE_ABSENT_GRACE_SECONDS = _env_float("CAO_RECONCILE_ABSENT_GRACE_SECONDS", 60.0)
+
 # Poll interval (seconds) for the OpenCode inbox poller. OpenCode buffers input
 # and its pipe-pane output can stop changing once the TUI settles, so the
 # FIFO/StatusMonitor pipeline may never emit an IDLE/COMPLETED status event to
