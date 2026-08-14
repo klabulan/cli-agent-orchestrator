@@ -500,13 +500,23 @@ class TestListSessions:
 
         assert result[0]["status"] == "active"
 
-    def test_list_sessions_returns_empty_on_error(self, tmux):
+    def test_list_sessions_raises_on_unreadable_server(self, tmux):
+        """harness-control#840: a generic backend read failure is "could not READ
+        the tmux server", NOT "there are no sessions" -- it must raise
+        TmuxLookupError so a caller can tell the two apart, never degrade to [].
+
+        Previously ``test_list_sessions_returns_empty_on_error`` asserting ``[]`` --
+        it ENCODED the swallow-to-empty behavior the #840 flap was built on (the
+        gateway read a fabricated empty list as fleet-wide substrate loss). Flipped
+        with the fix, same class as this file's own generic-error flips elsewhere.
+        """
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
         tmux.server.sessions = MagicMock(side_effect=Exception("no server"))
         tmux.server.sessions.__iter__ = MagicMock(side_effect=Exception("no server"))
 
-        result = tmux.list_sessions()
-
-        assert result == []
+        with pytest.raises(TmuxLookupError):
+            tmux.list_sessions()
 
 
 # ── get_session_windows ──────────────────────────────────────────────
@@ -533,12 +543,23 @@ class TestGetSessionWindows:
 
         assert result == []
 
-    def test_get_session_windows_error(self, tmux):
+    def test_get_session_windows_raises_on_unreadable_server(self, tmux):
+        """harness-control#840: same "could not read" != "absent" distinction as
+        list_sessions. A generic read failure now raises TmuxLookupError (via
+        get_session_windows' own ``except TmuxLookupError: raise`` branch), not [].
+        A genuinely-absent session still returns [] -- see
+        test_get_session_windows_session_not_found above -- so absence and
+        could-not-look stay distinguishable.
+
+        Previously ``test_get_session_windows_error`` asserting ``[]``; flipped
+        with the fix (zero production callers, so no behavior-change risk).
+        """
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
         tmux.server.sessions.get.side_effect = Exception("tmux error")
 
-        result = tmux.get_session_windows("ses")
-
-        assert result == []
+        with pytest.raises(TmuxLookupError):
+            tmux.get_session_windows("ses")
 
 
 # ── kill_session ─────────────────────────────────────────────────────
