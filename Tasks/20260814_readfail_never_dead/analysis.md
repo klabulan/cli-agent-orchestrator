@@ -2,16 +2,31 @@
 
 **Incident (2026-08-14 ~11:34Z):** under host load (mass process spawn drove loadavg to ~13 on a
 4-core box), CAO's periodic reconcile misread a transient tmux/herdr read failure as proof a live
-terminal had died, and destroyed the entire sprint fleet in 16s, then re-created + re-killed in a
-loop (**268 kill ops**).
+terminal had died, reaped the running sprint fleet in one dense burst, then re-created and
+re-killed terminals in a sustained loop under the continued load.
+
+**Reproducible severity numbers** (all re-derived from the cited log below via
+`reproduce_incident_numbers.py` in this folder — the earlier headline "268 kill ops in 16s" did
+**NOT** reproduce against this log under any 16-second slicing and has been corrected here):
+
+- **Peak burst:** the densest 16-second window (`11:34:39–11:34:55`) holds **11 `Killed tmux window`
+  + 21 `Deleted terminal`** events — the tightest reaping slice anywhere in the file.
+- **Fleet-wide:** **22 distinct terminals deleted inside the 11:34 minute** (`11:34:00–11:35:00`) —
+  i.e. the whole running fleet at once, not a single session.
+- **Sustained loop:** reaping did not stop after the burst — **642 `Killed tmux window` / 659
+  `Deleted terminal`** events total, spread across `10:59:29–12:59:16` (~2h), as CAO re-created and
+  re-killed terminals under continued load. (These file totals grow while the log is still being
+  appended; the densest-window and per-minute figures above are anchored to fixed timestamps and are
+  stable across re-runs.)
 
 Definitive timeline from CAO's own file log
-(`~/.aws/cli-agent-orchestrator/logs/cao_2026-08-14_10-41-12.log`):
+(`~/.aws/cli-agent-orchestrator/logs/cao_2026-08-14_10-41-12.log`) — these exact lines reproduce
+verbatim (`grep -nE '11:34:3[0-9]'`):
 
 - `11:34:37 ERROR Failed to get history from cao-hc858…: Window '…1cf0' not found in session`
   + `WARNING Failed to snapshot terminal b4c1f349: Window not found`.
 - `11:34:38 → Stopped FIFO reader → Cleaned up provider → Deleted terminal: b4c1f349`.
-- `11:34:39–55 → Killed tmux window:` for the whole fleet.
+- `11:34:39–55 → Killed tmux window:` for the fleet (the peak-burst window above).
 
 Deployed CAO at the time = `b067e9e` (klabulan `hc840-cao-consolidated-6f13d9f-plus7` tip). This
 analysis was produced against that exact commit (the base of this fix branch).
