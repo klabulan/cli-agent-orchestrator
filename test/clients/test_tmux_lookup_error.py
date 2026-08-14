@@ -112,6 +112,32 @@ class TestReadListing:
         assert not issubclass(TmuxLookupError, ValueError)
         assert issubclass(TmuxLookupError, RuntimeError)
 
+    # ── harness-control#840 (the "unfixed half"): a GENERIC transient read
+    # failure (not the strict-zip ValueError parse race) is ALSO "could not
+    # look", not a real answer. It used to escape _read_listing raw and get
+    # swallowed to []/False one layer up, fabricating "no sessions"/"gone" for a
+    # live session under load. It now retries and classifies exactly like a
+    # parse race.
+
+    def test_retries_once_and_succeeds_after_a_generic_error(self):
+        read = MagicMock(side_effect=[RuntimeError("libtmux server busy"), "ok"])
+
+        assert TmuxClient._read_listing("list-sessions", read) == "ok"
+        assert read.call_count == 2
+
+    def test_raises_lookup_error_after_a_second_generic_failure(self):
+        boom = RuntimeError("tmux server unreachable under load")
+        read = MagicMock(side_effect=[boom, boom])
+
+        with pytest.raises(TmuxLookupError) as excinfo:
+            TmuxClient._read_listing("list-sessions", read)
+
+        # Bounded: exactly two attempts, and classified as could-not-look, not
+        # a raw exception a caller swallows to "absent".
+        assert read.call_count == 2
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert not isinstance(excinfo.value, ValueError)
+
 
 # ── get_history: the watchdog / status-polling hot path ──────────────
 
@@ -223,11 +249,30 @@ class TestSessionExistsParseFailure:
             with pytest.raises(TmuxLookupError):
                 tmux.session_exists("ses")
 
-    def test_unrelated_failure_still_returns_false(self, tmux):
-        """Pre-existing behavior for non-parse errors is unchanged."""
-        tmux.server.sessions.get.side_effect = RuntimeError("boom")
+    def test_generic_error_falls_back_to_has_session_not_a_fabricated_false(self, tmux):
+        """harness-control#840: a non-parse transient (LibTmuxException, a
+        subprocess timeout to an overloaded server) used to be swallowed STRAIGHT
+        TO False here -- the identical "a LIVE session reported gone" bug as a
+        parse race, one exception-type away, and the exact thing that drove the
+        gateway to re-mint root terminal ids. It now takes the SAME has-session
+        fallback a parse race does, so a live session is confirmed alive.
 
-        assert tmux.session_exists("ses") is False
+        This test previously asserted a bare ``False`` and was named
+        ``test_unrelated_failure_still_returns_false`` -- it ENCODED the bug (cf.
+        56e67499's analogous ``test_get_session_not_in_list`` flip).
+        """
+        tmux.server.sessions.get.side_effect = RuntimeError("libtmux server busy")
+
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
+            assert tmux.session_exists("ses") is True
+
+        assert mock_subprocess.run.call_args[0][0] == [
+            "tmux",
+            "has-session",
+            "-t",
+            "=ses",
+        ]
 
 
 # ── criterion 4: no half-state left behind by a failed launch ────────
@@ -363,6 +408,17 @@ class TestListingsDoNotDegradeToEmpty:
         type(tmux.server).sessions = property(
             lambda self: (_ for _ in ()).throw(ValueError(ZIP_ERROR))
         )
+
+        with pytest.raises(TmuxLookupError):
+            tmux.list_sessions()
+
+    def test_list_sessions_raises_instead_of_returning_empty_on_generic_error(self, tmux):
+        """harness-control#840 (the flap driver): a transient GENERIC backend
+        failure (not the strict-zip parse race) must NOT masquerade as "no
+        sessions". Pre-fix `list_sessions` swallowed it to [], which the gateway
+        read as fleet-wide substrate loss."""
+        boom = RuntimeError("tmux server overloaded")
+        type(tmux.server).sessions = property(lambda self: (_ for _ in ()).throw(boom))
 
         with pytest.raises(TmuxLookupError):
             tmux.list_sessions()

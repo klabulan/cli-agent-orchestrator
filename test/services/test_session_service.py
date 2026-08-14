@@ -161,6 +161,43 @@ class TestListSessions:
 
         assert result == []
 
+    # ── harness-control#840 (the "unfixed half"): a TmuxLookupError is the
+    # backend saying "I could not READ the tmux server", NOT "there are no
+    # sessions". The default (non-strict) path still degrades to [] for the
+    # failure-isolated SSE snapshot builders; the strict path (the GET /sessions
+    # substrate-presence poll) RE-RAISES it so the route answers 5xx instead of a
+    # fabricated 200 [] that the gateway reads as fleet-wide substrate loss and
+    # uses to re-mint every live session's root terminal id.
+
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_lookup_error_non_strict_still_degrades_to_empty(self, mock_get_backend):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        mock_get_backend.return_value.list_sessions.side_effect = TmuxLookupError("unreadable")
+
+        assert list_sessions() == []
+        assert list_sessions(strict=False) == []
+
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_lookup_error_strict_reraises(self, mock_get_backend):
+        """THE flap-driver regression: 'could not read tmux' must never look like
+        'no sessions' on the gateway's substrate-presence poll."""
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        mock_get_backend.return_value.list_sessions.side_effect = TmuxLookupError("unreadable")
+
+        with pytest.raises(TmuxLookupError):
+            list_sessions(strict=True)
+
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_strict_unrelated_error_still_empty(self, mock_get_backend):
+        """strict only surfaces the could-not-read signal (TmuxLookupError); an
+        unrelated bug is still swallowed to [] exactly as before, so strict mode
+        does not turn every incidental exception into a 5xx."""
+        mock_get_backend.return_value.list_sessions.side_effect = Exception("some other bug")
+
+        assert list_sessions(strict=True) == []
+
 
 class TestGetSession:
     """Tests for get_session function."""

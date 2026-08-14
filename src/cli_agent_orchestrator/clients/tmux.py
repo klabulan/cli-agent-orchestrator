@@ -88,10 +88,12 @@ class TmuxClient:
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
     # Every read that makes libtmux shell out to `list-sessions` /
-    # `list-windows` / `list-panes` goes through _read_listing() below, so a
-    # transient parse failure (see TmuxLookupError) becomes a distinct,
-    # retryable, non-fatal condition instead of a raw ValueError that reads
-    # like "not found" one layer up.
+    # `list-windows` / `list-panes` goes through _read_listing() below, so ANY
+    # transient read failure -- the strict-`zip` parse race (see TmuxLookupError)
+    # OR a generic libtmux/subprocess failure against a slow, overloaded server
+    # under fleet load (harness-control#840) -- becomes a distinct, retryable,
+    # non-fatal `TmuxLookupError` instead of a raw exception that a caller
+    # swallows to "[]"/"False" and reads like "not found" one layer up.
 
     # Short pause before the single retry so the mid-listing race (a pane or
     # session vanishing between tmux's enumeration and its output) has settled.
@@ -101,14 +103,30 @@ class TmuxClient:
 
     @classmethod
     def _read_listing(cls, description: str, read: Callable[[], _T]) -> _T:
-        """Run one libtmux listing read, retrying ONCE on a parse failure.
+        """Run one libtmux listing read, retrying ONCE on ANY read failure.
 
         ``read`` must contain nothing but libtmux attribute access / query
-        calls. That invariant is what lets us classify *any* ``ValueError``
-        escaping it as a libtmux parse failure rather than matching on
-        CPython's ``zip()`` message text (which is not part of any contract).
-        Callers therefore raise their own "not found" ``ValueError``s outside
-        the callable, never inside it.
+        calls. That invariant is what lets us classify *any exception* escaping
+        it as a "could not read the tmux server" failure rather than a genuine
+        "absent" answer: a real absence is signalled by ``read`` RETURNING
+        ``None``/``[]`` (``QueryList.get(default=None)``), never by raising, and
+        callers raise their own "not found" ``ValueError``s OUTSIDE the callable.
+
+        harness-control#840 (the "unfixed half"): this used to classify only
+        ``ValueError`` (the libtmux >=0.53.1 strict-``zip`` parse race, see
+        ``TmuxLookupError``) as retryable, letting EVERY OTHER transient libtmux
+        failure -- a ``LibTmuxException`` / subprocess timeout / connection hiccup
+        to a slow, overloaded tmux server under fleet load -- escape as a raw,
+        non-``TmuxLookupError`` exception. Its callers (``list_sessions`` /
+        ``session_exists``) then swallowed THAT to ``[]`` / ``False``, fabricating
+        "no sessions" / "session gone" for a session that was in fact live. The
+        harness-control gateway read that fabricated-empty ``GET /sessions`` as
+        fleet-wide substrate loss and re-minted every live session's root terminal
+        id on nearly every poll, never converging (606 reissue events in one
+        storm). "Could not read the server" is UNKNOWN, not "absent", for a
+        transient backend failure exactly as much as for a parse race -- so both
+        now retry once and, if still failing, raise ``TmuxLookupError`` so a
+        caller can tell "we could not look" from "it is really gone".
 
         Args:
             description: What was being read, for the log/error message.
@@ -118,23 +136,25 @@ class TmuxClient:
             Whatever ``read`` returns.
 
         Raises:
-            TmuxLookupError: The read failed to parse twice in a row.
+            TmuxLookupError: The read failed twice in a row (parse race or any
+                other transient backend failure).
         """
         try:
             return read()
-        except ValueError as first_error:
+        except Exception as first_error:  # noqa: BLE001 — any read failure is "could not look"
             logger.warning(
-                "tmux listing parse failed (%s): %s — retrying once", description, first_error
+                "tmux listing read failed (%s): %s — retrying once", description, first_error
             )
 
         time.sleep(cls._LISTING_RETRY_DELAY_S)
         try:
             return read()
-        except ValueError as second_error:
+        except Exception as second_error:  # noqa: BLE001 — see above
             raise TmuxLookupError(
                 f"Could not read tmux listing ({description}): {second_error}. "
-                "The tmux server output failed to parse twice; this is transient "
-                "and says nothing about whether the target still exists."
+                "The tmux server listing could not be read twice in a row (a parse "
+                "race or a transient backend failure); this is transient and says "
+                "nothing about whether the target still exists."
             ) from second_error
 
     def _find_session(self, session_name: str) -> Optional[Session]:

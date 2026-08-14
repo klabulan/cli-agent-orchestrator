@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
+from cli_agent_orchestrator.clients.tmux import TmuxLookupError
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -112,11 +113,37 @@ async def create_session(
     return terminal
 
 
-def list_sessions() -> List[Dict]:
-    """List all sessions from tmux."""
+def list_sessions(strict: bool = False) -> List[Dict]:
+    """List all CAO-managed sessions from the backend.
+
+    ``strict`` (harness-control#840, the "unfixed half"): when False (the
+    default, preserved for the SSE dashboard/fleet snapshot builders that are
+    explicitly failure-isolated and want an empty snapshot on any backend
+    hiccup), a ``TmuxLookupError`` -- the backend saying "I could not READ the
+    tmux server", NOT "there are no sessions" -- is still degraded to ``[]``.
+
+    When True (the ``GET /sessions`` route, which the harness-control gateway
+    polls as its authoritative substrate-PRESENCE signal), that same
+    "could-not-read" condition is RE-RAISED so the route can answer 5xx instead
+    of a fabricated ``200 []``. A fabricated empty list is exactly what drove
+    the #840 flap: the gateway read it as fleet-wide substrate loss and re-minted
+    every live session's root terminal id every poll. A genuine empty list (the
+    backend read fine and there really are no sessions) is unaffected either way;
+    only the unreadable-backend case changes, and only in ``strict`` mode. The
+    gateway already treats a non-404 error from this endpoint as "skip this poll,
+    do not alarm" (its own positive-evidence recovery design), so surfacing the
+    failure is strictly safer than hiding it behind an empty list.
+    """
     try:
         tmux_sessions = get_backend().list_sessions()
         return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+    except TmuxLookupError:
+        if strict:
+            # "Could not read the substrate" must never masquerade as "no
+            # sessions" for the gateway's substrate-presence poll (#840).
+            raise
+        logger.error("Failed to list sessions: tmux listing unreadable (transient)")
+        return []
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
@@ -152,9 +179,19 @@ def get_session(session_name: str) -> Dict:
         # defaults to "detached" for the synthesized case; it is cosmetic
         # (attached-clients flag) and the per-terminal status enriched below is
         # derived independently and is unaffected.
-        session_data = next(
-            (s for s in backend.list_sessions() if s["id"] == session_name), None
-        )
+        # The session's existence is already authoritative (session_exists above).
+        # This listing is only to enrich the cosmetic session_data (attached-clients
+        # flag). harness-control#840: now that a transient tmux read raises
+        # TmuxLookupError instead of degrading to [] (clients/tmux.py::_read_listing),
+        # a hiccup here must NOT bubble up and 500 a session we JUST confirmed live --
+        # that would re-open the very "confirmed live but detail errors" flap 56e67499
+        # closed. Fall back to the synthesized record, exactly as for an absent-from-
+        # snapshot session.
+        try:
+            listing = backend.list_sessions()
+        except TmuxLookupError:
+            listing = []
+        session_data = next((s for s in listing if s["id"] == session_name), None)
         if session_data is None:
             session_data = {"id": session_name, "name": session_name, "status": "detached"}
 

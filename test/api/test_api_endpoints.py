@@ -657,6 +657,36 @@ class TestListSessions:
         assert response.status_code == 500
         assert "Failed to list sessions" in response.json()["detail"]
 
+    def test_list_sessions_polls_with_strict(self, client):
+        """harness-control#840: the substrate-presence poll must opt into strict
+        so a 'could not read tmux' can surface, not be degraded to []."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.list_sessions.return_value = []
+
+            client.get("/sessions")
+
+        assert mock_svc.list_sessions.call_args.kwargs.get("strict") is True
+
+    def test_list_sessions_unreadable_tmux_is_503_not_empty_200(self, client):
+        """THE #840 flap-driver regression. When the tmux server cannot be READ,
+        GET /sessions must answer 503 -- NEVER a fabricated 200 []. A fabricated
+        empty list is what the harness-control gateway read as fleet-wide
+        substrate loss, re-minting every live session's root terminal id every
+        poll (606 reissue events in one storm). 503 makes the gateway skip the
+        poll (its own positive-evidence recovery design) instead."""
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.list_sessions.side_effect = TmuxLookupError(
+                "Could not read tmux listing (list-sessions): server overloaded"
+            )
+
+            response = client.get("/sessions")
+
+        assert response.status_code == 503
+        assert response.json() != []
+        assert "transient" in response.json()["detail"].lower()
+
 
 class TestGetSession:
     """Tests for GET /sessions/{session_name} endpoint."""

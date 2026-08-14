@@ -153,6 +153,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
+from cli_agent_orchestrator.clients.tmux import TmuxLookupError
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
@@ -2513,7 +2514,21 @@ async def create_session(
 @app.get("/sessions")
 async def list_sessions() -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        # strict=True: this is the authoritative substrate-PRESENCE endpoint the
+        # harness-control gateway polls. A transient "could not read tmux"
+        # (TmuxLookupError) must surface as 503, NEVER a fabricated 200 [] --
+        # a fabricated empty list reads to the gateway as fleet-wide substrate
+        # loss and re-mints every live session's root terminal id every poll
+        # (harness-control#840). 503 makes the gateway skip the poll instead.
+        return session_service.list_sessions(strict=True)
+    except TmuxLookupError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Could not read the tmux server to list sessions ({e}); this is "
+                "transient and does NOT mean there are no sessions. Retry."
+            ),
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
