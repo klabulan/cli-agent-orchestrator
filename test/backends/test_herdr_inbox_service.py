@@ -843,13 +843,18 @@ class TestHerdrInboxServiceLabelLiveness:
         mock_delete.assert_not_called()
         assert service._pane_to_terminal.get("p1") == "tid1"
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch.object(HerdrInboxService, "_label_still_live")
-    def test_pane_closed_deletes_on_confirmed_gone(
+    def test_pane_closed_deletes_on_confirmed_gone_under_immediate_knobs(
         self, mock_live, mock_meta, mock_delete
     ):
-        """pane.closed with a CONFIRMED-gone label (False) still reaps fast."""
+        """pane.closed with a CONFIRMED-gone label (False) reaps immediately when
+        the grace knobs are set to (threshold=1, grace=0) — i.e. genuine-close
+        reaping still works; it is now merely GATED by the same threshold+grace as
+        every other teardown site, not skipped."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._pane_to_terminal = {"p1": "tid1"}
         service._terminal_to_pane = {"tid1": "p1"}
@@ -858,6 +863,59 @@ class TestHerdrInboxServiceLabelLiveness:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
 
+        mock_delete.assert_called_once_with("tid1")
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_label_still_live")
+    def test_pane_closed_confirmed_gone_defers_under_default_grace(
+        self, mock_live, mock_meta, mock_delete
+    ):
+        """FINDING #2 fast-path fix: pane.closed with a CONFIRMED-gone label
+        (False) must NOT reap on a SINGLE observation under the default grace
+        (threshold=3/60s). A successful `herdr tab list` can still return a
+        truncated/stale-but-parsed 'label gone' under the same load that caused
+        the fleet-death — so the confirmed-close fast path is now routed through
+        the identical threshold+grace gate as reconcile. First observation defers;
+        maps + DB row are left intact for the reconcile grace backstop to reap."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "p1"}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_live.return_value = False  # query OK, label genuinely gone (once)
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
+
+        mock_delete.assert_not_called()
+        # maps untouched so the reconcile grace backstop still tracks it
+        assert service._pane_to_terminal.get("p1") == "tid1"
+        assert service._terminal_to_pane.get("tid1") == "p1"
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 3)
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_label_still_live")
+    def test_pane_closed_confirmed_gone_reaped_after_threshold(
+        self, mock_live, mock_meta, mock_delete
+    ):
+        """A genuinely-closed pane is still reaped: after THRESHOLD consecutive
+        confirmed-gone pane.closed observations (grace=0), the fast path tears it
+        down — cleanup is preserved, only single-observation reaping is removed."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "p1"}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_live.return_value = False  # query OK, label genuinely gone every time
+
+        # Observations 1 and 2 defer (below threshold).
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("p1") == "tid1"
+
+        # Third observation crosses the threshold → reaped.
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
         mock_delete.assert_called_once_with("tid1")
 
 
@@ -1022,10 +1080,16 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
 class TestHerdrInboxServiceLifecycleEvents:
     """Test _handle_lifecycle_event for pane.closed and workspace.closed."""
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_removes_from_maps(self, mock_meta, mock_delete):
-        """pane.closed should remove the terminal from tracking maps and delete DB record."""
+        """pane.closed should remove the terminal from tracking maps and delete DB
+        record. Immediate knobs (threshold=1/grace=0) so this exercises the reap
+        itself; the confirmed-close teardown is now gated by the same grace as
+        reconcile (see TestHerdrInboxServiceLabelLiveness for the default-grace
+        defer behavior)."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-a", is_kiro=True)
         service._working_since["tid1"] = time.time()
@@ -1093,11 +1157,16 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert service._pane_to_terminal.get("pane-3") == "9d00610c"
         assert service._terminal_to_pane.get("9d00610c") == "pane-3"
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_deletes_when_label_gone(self, mock_meta, mock_delete, mock_run):
         """Genuine close (label absent from herdr) still deletes the terminal.
+        Immediate knobs (threshold=1/grace=0): the confirmed-gone fast path is now
+        grace-gated, so single-observation reaping requires the immediate knobs;
+        default-grace defer is covered in TestHerdrInboxServiceLabelLiveness.
 
         This is the user-initiated-close path: no kill_window ran, so the
         pane_closed event is the only signal. The tab label is genuinely gone
@@ -1274,10 +1343,14 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "pane.closed" in handled
         assert "workspace.closed" in handled
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_event_loop_pane_closed_real_shape_cleans_up(self, mock_meta, mock_delete):
-        """End-to-end: a real-shape pane_closed event removes the managed terminal."""
+        """End-to-end: a real-shape pane_closed event removes the managed terminal.
+        Immediate knobs (threshold=1/grace=0) — the confirmed-close teardown is now
+        grace-gated (see TestHerdrInboxServiceLabelLiveness for default-grace defer)."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid-x", "pane-x", is_kiro=False)
         mock_meta.return_value = None  # no session → no kill_session

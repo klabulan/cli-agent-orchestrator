@@ -790,6 +790,27 @@ class HerdrInboxService:
                     )
                     return
 
+            # Corroborate the close across the grace window before the irreversible
+            # teardown. This is the fast path where the pane.closed event AND a
+            # successful `_label_still_live()==False` agree the tab is gone — but a
+            # successful `herdr tab list` can still return a truncated/stale-but-
+            # parsed "label gone" under the exact load that caused the 2026-08-14
+            # fleet-death, so a SINGLE confirmed-gone observation is not enough.
+            # Route it through the SAME threshold+grace gate as reconcile (finding
+            # #2: this was the one delete/kill site in the read-under-load class
+            # still reaping on a single observation). Defer leaves the maps + DB row
+            # intact so the reconcile grace backstop (stale-pane diff / ghost-DB
+            # cross-check) reaps a genuinely-closed pane once absence is confirmed
+            # past the grace. THRESHOLD=1,GRACE=0 restores immediate teardown.
+            if not self._confirm_absent_or_defer(terminal_id, time.monotonic(), {}):
+                logger.info(
+                    "pane.closed: %s confirmed-gone once (pane=%s) — deferring "
+                    "teardown to grace; reconcile reaps past the grace window",
+                    terminal_id,
+                    pane_id,
+                )
+                return
+
             # Remove from maps
             self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
