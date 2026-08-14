@@ -439,11 +439,18 @@ class TestHerdrInboxServiceReconcile:
         assert inspect.iscoroutinefunction(service._reconcile)
         assert inspect.iscoroutinefunction(service._subscribe_all_events)
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_prunes_stale_pane(self, mock_meta, mock_delete, mock_snap):
-        """Stale pane_ids (not in live herdr snapshot) are pruned from maps and DB."""
+        """Stale pane_ids (tab authoritatively absent) are pruned from maps and DB.
+
+        Runs with the grace disabled (threshold=1, grace=0) to assert the reaping
+        still happens on an authoritative confirmed-absent observation. The grace
+        gating itself is covered by TestHerdrInboxServiceReadFailureGrace.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-live")
         service.register_terminal("tid2", "pane-stale")
@@ -497,13 +504,20 @@ class TestHerdrInboxServiceReconcile:
         # Map unchanged
         assert "pane-a" in service._pane_to_terminal
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_reconcile_deletes_ghost_db_terminals(
         self, mock_list_terminals, mock_delete, mock_snap
     ):
-        """Ghost DB terminals (tab not in herdr) are deleted; live terminals are kept."""
+        """Ghost DB terminals (tab authoritatively absent) are reaped past grace.
+
+        Grace disabled (threshold=1, grace=0) so a single authoritative
+        confirmed-absent observation reaps — asserting the cleanup path survives
+        the read-failure fix. Grace gating is covered separately.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
 
@@ -591,6 +605,260 @@ class TestHerdrInboxServiceReconcile:
         # Must not raise; w1:p1 is live so nothing pruned.
         _run_async(service._reconcile())
         assert service._pane_to_terminal == {"w1:p1": "tid1"}
+
+
+class TestHerdrInboxServiceReadFailureGrace:
+    """The read-failure fleet-death regression suite (2026-08-14).
+
+    Invariant under test: a transient tmux/herdr READ failure is UNKNOWN, never
+    "terminal dead". Teardown fires only on AUTHORITATIVE confirmed-absence, and
+    only after the configurable threshold + wall-clock grace. See
+    Tasks/20260814_readfail_never_dead/.
+    """
+
+    @staticmethod
+    def _backend_whose_get_pane_id_raises():
+        backend = MagicMock()
+        backend._pane_cache = {}
+        backend.get_pane_id.side_effect = RuntimeError(
+            "Window 'x' not found in session 'y'"  # transient read failure under load
+        )
+        return backend
+
+    # ── Test A: the bug — read failure on a LIVE tab must NOT delete ──────────
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_read_failure_on_live_tab_does_not_delete(
+        self, mock_meta, mock_delete, mock_snap, mock_get_backend
+    ):
+        """Tab label present in the snapshot (LIVE) but get_pane_id re-resolve
+        raises (transient read failure): the terminal must be LEFT INTACT — never
+        deleted. This is the exact line that destroyed the fleet."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid_live", "pane-live")
+        service.register_terminal("tid_stale", "pane-stale")  # pane renumbered
+
+        # Snapshot: pane-stale fell out of live panes, BUT its tab label is live.
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-live"}],
+            "tabs": [{"label": "win-stale", "workspace_id": "ws1"}],
+            "workspaces": [{"workspace_id": "ws1", "label": "sess"}],
+        }
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-stale"}
+        mock_get_backend.return_value = self._backend_whose_get_pane_id_raises()
+
+        _run_async(service._reconcile())
+
+        # NEVER deleted — a read failure on a confirmed-live tab is UNKNOWN.
+        mock_delete.assert_not_called()
+        # Left intact for retry (maps untouched).
+        assert service._pane_to_terminal.get("pane-stale") == "tid_stale"
+        assert service._terminal_to_pane.get("tid_stale") == "pane-stale"
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    def test_snapshot_read_failure_deletes_nothing(self, mock_delete, mock_snap):
+        """Whole-snapshot read failure (None) is UNKNOWN → nothing torn down."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-1")
+        mock_snap.return_value = None
+
+        _run_async(service._reconcile())
+
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("pane-1") == "tid1"
+
+    # ── Test B: no regression — genuine absence IS reaped after the grace ─────
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 3)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_genuinely_absent_tab_is_reaped_after_threshold(
+        self, mock_meta, mock_delete, mock_snap, mock_get_backend
+    ):
+        """A tab genuinely absent from every successful snapshot is deferred for
+        THRESHOLD-1 passes, then reaped — orphan cleanup preserved."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid_gone", "pane-gone")
+
+        # pane-gone is stale AND its tab label is absent from the snapshot.
+        mock_snap.return_value = {
+            "panes": [],
+            "tabs": [{"label": "some-other-window", "workspace_id": "ws1"}],
+            "workspaces": [{"workspace_id": "ws1", "label": "sess"}],
+        }
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
+        mock_get_backend.return_value = MagicMock()
+
+        # Passes 1 and 2: within threshold → deferred, not deleted, left intact.
+        _run_async(service._reconcile())
+        _run_async(service._reconcile())
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("pane-gone") == "tid_gone"
+
+        # Pass 3: threshold reached (grace=0) → reaped.
+        _run_async(service._reconcile())
+        mock_delete.assert_called_once_with("tid_gone")
+        assert "pane-gone" not in service._pane_to_terminal
+
+    # ── Test C: the config knobs actually gate behavior ──────────────────────
+    def _absent_snapshot_service(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid_gone", "pane-gone")
+        return service
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_default_knobs_defer_single_confirmed_absent_pass(
+        self, mock_meta, mock_delete, mock_snap, mock_get_backend
+    ):
+        """At defaults (threshold=3, grace=60s) a single confirmed-absent pass
+        does NOT delete."""
+        service = self._absent_snapshot_service()
+        mock_snap.return_value = {"panes": [], "tabs": [], "workspaces": []}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
+        mock_get_backend.return_value = MagicMock()
+
+        _run_async(service._reconcile())
+
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_immediate_knobs_delete_single_confirmed_absent_pass(
+        self, mock_meta, mock_delete, mock_snap, mock_get_backend
+    ):
+        """With threshold=1, grace=0 the SAME single pass DOES delete — proving
+        the knobs, not something else, gate the behavior."""
+        service = self._absent_snapshot_service()
+        mock_snap.return_value = {"panes": [], "tabs": [], "workspaces": []}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
+        mock_get_backend.return_value = MagicMock()
+
+        _run_async(service._reconcile())
+
+        mock_delete.assert_called_once_with("tid_gone")
+
+    # ── Test D: the wall-clock timer, isolated and deterministic ─────────────
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 60.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
+    def test_confirm_absent_respects_wall_clock_grace(self):
+        """Even with the count satisfied (threshold=1), teardown waits until
+        GRACE_SECONDS of wall-clock has elapsed — the second, independent timer."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        decided: dict = {}
+
+        # t0: count ok, elapsed 0 < 60 → defer.
+        assert service._confirm_absent_or_defer("tid", 1000.0, decided) is False
+        # t+30s (fresh pass, so clear the per-pass memo): still < 60 → defer.
+        assert service._confirm_absent_or_defer("tid", 1030.0, {}) is False
+        # t+61s: elapsed 61 >= 60 AND count >= 1 → tear down.
+        assert service._confirm_absent_or_defer("tid", 1061.0, {}) is True
+
+    # ── Test E: a recovered flap clears the counter (no stale accumulation) ───
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 3)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reappearing_pane_clears_absent_counter(
+        self, mock_meta, mock_delete, mock_snap, mock_get_backend
+    ):
+        """A terminal confirmed-absent once, then seen live again, resets its
+        counter so a later absence starts the grace from scratch."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-1")
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_get_backend.return_value = MagicMock()
+
+        # Pass 1: absent → count 1 (deferred).
+        mock_snap.return_value = {"panes": [], "tabs": [], "workspaces": []}
+        _run_async(service._reconcile())
+        assert service._absent_count.get("tid1") == 1
+
+        # Pass 2: pane-1 live again → counter cleared.
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1"}], "tabs": [], "workspaces": []}
+        _run_async(service._reconcile())
+        assert "tid1" not in service._absent_count
+        mock_delete.assert_not_called()
+
+
+class TestHerdrInboxServiceLabelLiveness:
+    """`_label_still_live` is tri-state, and pane.closed defers on UNKNOWN."""
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_label_live_returns_true(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=json.dumps({"result": {"tabs": [{"label": "win"}]}})
+        )
+        assert service._label_still_live("win") is True
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_label_confirmed_gone_returns_false(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=json.dumps({"result": {"tabs": [{"label": "other"}]}})
+        )
+        assert service._label_still_live("win") is False
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_label_query_failure_returns_none_unknown(self, mock_run):
+        """A failed herdr query is UNKNOWN (None), NOT False — a read failure is
+        never proof of absence."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+        assert service._label_still_live("win") is None
+
+        mock_run.side_effect = OSError("herdr binary vanished")
+        assert service._label_still_live("win") is None
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_label_still_live")
+    def test_pane_closed_defers_on_unknown_liveness(
+        self, mock_live, mock_meta, mock_delete
+    ):
+        """pane.closed with UNKNOWN (None) label liveness must NOT delete —
+        the lifecycle half of the read-failure bug."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "p1"}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_live.return_value = None  # herdr query failed → UNKNOWN
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
+
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("p1") == "tid1"
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_label_still_live")
+    def test_pane_closed_deletes_on_confirmed_gone(
+        self, mock_live, mock_meta, mock_delete
+    ):
+        """pane.closed with a CONFIRMED-gone label (False) still reaps fast."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "p1"}
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_live.return_value = False  # query OK, label genuinely gone
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "p1"})
+
+        mock_delete.assert_called_once_with("tid1")
 
 
 class TestHerdrInboxSnapshot:
@@ -864,11 +1132,14 @@ class TestHerdrInboxServiceLifecycleEvents:
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    def test_pane_closed_deletes_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
-        """If herdr cannot be queried, fall back to deleting (fail toward cleanup).
+    def test_pane_closed_defers_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
+        """If herdr cannot be queried, liveness is UNKNOWN — do NOT delete.
 
-        We must never leave a terminal we believe is open when it may be closed,
-        so an unreachable herdr makes the liveness check fail toward delete.
+        Regression for the 2026-08-14 read-failure fleet-death (lifecycle half):
+        a herdr query failing under load used to "fall toward delete", turning a
+        possibly-stale replayed pane.closed into a live-terminal kill. A read
+        failure is never proof of death; the reconcile grace backstop reaps a
+        genuinely-closed pane once its absence is authoritatively confirmed.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
@@ -879,7 +1150,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         def subprocess_side_effect(cmd, **_):
             m = MagicMock()
-            m.returncode = 1  # herdr query failed
+            m.returncode = 1  # herdr query failed → UNKNOWN
             m.stdout = ""
             m.stderr = "boom"
             return m
@@ -888,8 +1159,9 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
 
-        mock_delete.assert_called_once_with("9d00610c")
-        assert "pane-3" not in service._pane_to_terminal
+        # UNKNOWN liveness must never delete; the terminal stays mapped.
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("pane-3") == "9d00610c"
 
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
@@ -1130,6 +1402,8 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         # Old (renumbered-away) pane_id is gone from the map.
         assert "pane-old" not in service._pane_to_terminal
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_GRACE_SECONDS", 0.0)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.RECONCILE_ABSENT_THRESHOLD", 1)
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch.object(HerdrInboxService, "_fetch_snapshot")
@@ -1138,7 +1412,11 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
     def test_reconcile_deletes_when_tab_label_gone(
         self, mock_meta, mock_delete, mock_snap, mock_run, mock_get_backend
     ):
-        """Stored pane_id missing AND tab label absent from herdr -> prune maps + delete."""
+        """Stored pane_id missing AND tab label absent from herdr -> prune + delete.
+
+        Grace disabled (threshold=1, grace=0) so one authoritative confirmed-absent
+        pass reaps — asserting genuine-close cleanup survives the read-failure fix.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-old")
         service._working_since["tid1"] = time.time()
