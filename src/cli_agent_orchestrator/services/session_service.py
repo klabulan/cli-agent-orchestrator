@@ -20,11 +20,13 @@ Session Lifecycle:
 """
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -47,13 +49,36 @@ async def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    engine: KiroEngine | str | None = None,
+    initial_message: str | None = None,
+    initial_message_orchestration_type: OrchestrationType | None = None,
+    model: str | None = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    When ``initial_message`` is provided, the initial terminal uses the
+    existing deferred-init path so provider initialization and delivery can
+    continue after the session response. Omitting it preserves the synchronous
+    initialization behavior used by existing callers.
+    On the deferred path, the ``post_create_session`` plugin event is dispatched
+    before provider initialization and message delivery finish.
+
+    ``group``/``metadata`` are the #432 discovery fields, set on the initial
+    terminal at creation time (``group`` is also updatable later via
+    ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
+    MCP tool).
     """
+    if initial_message == "":
+        raise ValueError("initial_message must not be empty")
+    if initial_message is None and initial_message_orchestration_type is not None:
+        raise ValueError("initial_message_orchestration_type requires initial_message")
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
@@ -68,6 +93,13 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        engine=engine,
+        defer_init=initial_message is not None,
+        initial_message=initial_message,
+        initial_message_orchestration_type=initial_message_orchestration_type,
+        model=model,
+        group=group,
+        metadata=metadata,
     )
     dispatch_plugin_event(
         registry,
@@ -93,14 +125,38 @@ def list_sessions() -> List[Dict]:
 def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
     try:
-        if not get_backend().session_exists(session_name):
+        backend = get_backend()
+        # session_exists() is the AUTHORITATIVE existence check. On the tmux
+        # backend it falls back to a direct `tmux has-session` probe when the
+        # listing cannot be parsed (clients/tmux.py::session_exists), so it does
+        # NOT spuriously answer False on a transient. If it says the session is
+        # gone, that is a real 404.
+        if not backend.session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
-        tmux_sessions = get_backend().list_sessions()
-        session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
-
-        if not session_data:
-            raise ValueError(f"Session '{session_name}' not found")
+        # harness-control#840 (the "listed but detail 404s" flap driver, fixed
+        # here at the source). The pre-fix code additionally REQUIRED the session
+        # to appear in a SECOND, independent list_sessions() round trip and 404'd
+        # it otherwise. That is a TOCTOU with a live-session false-negative:
+        # TmuxClient.list_sessions() swallows a transient generic tmux error to
+        # [] (see its own body -- only a parse failure raises; everything else
+        # returns an empty list), so a session that session_exists() *just*
+        # confirmed LIVE could still 404 here purely because this redundant
+        # listing momentarily came back empty -- while GET /sessions, which a
+        # client polls a beat apart, still reported it. Downstream (the
+        # harness-control gateway) read that "listed but detail 404s" as substrate
+        # loss and tore live sessions down on wake (12 fatal give-ups on
+        # 2026-08-13). A session already confirmed to exist is therefore NEVER
+        # 404'd merely for being absent from this one snapshot: use its real
+        # listing record when present, else synthesize a minimal one. status
+        # defaults to "detached" for the synthesized case; it is cosmetic
+        # (attached-clients flag) and the per-terminal status enriched below is
+        # derived independently and is unaffected.
+        session_data = next(
+            (s for s in backend.list_sessions() if s["id"] == session_name), None
+        )
+        if session_data is None:
+            session_data = {"id": session_name, "name": session_name, "status": "detached"}
 
         terminals = list_terminals_by_session(session_name)
         # Enrich each terminal with its live status. list_terminals_by_session

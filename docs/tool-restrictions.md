@@ -109,9 +109,18 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Provider built-in capabilities | (internal) | (internal) |
 | `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
+| `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
 CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
+
+#### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
+
+`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
+
+This is deliberate (see the design discussion on [issue #432](https://github.com/awslabs/cli-agent-orchestrator/issues/432)): the supervisor/worker hierarchy `handoff`/`assign`/`send_message` are built around, and the flat peer layer `group`/`list_siblings`/`update_metadata` introduce, are two different communication topologies. A profile should be able to keep one without the other. See [Discovery Tool Coexistence](discovery-tool-coexistence.md) for the full rationale, the enforcement mechanism, and open follow-ups.
+
+**`group` is an organizational label, not a security boundary.** On a default install with auth disabled, a worker already has local shell access, so `discovery`/`group`/session-scoping provide no isolation guarantee even when used together — see [docs/api.md](api.md) and the coexistence write-up linked above.
 
 ### 3. `--yolo` — The Escape Hatch
 
@@ -241,9 +250,12 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Claude Code** | Hard | `--disallowedTools` flags block specific tools |
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
+| **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
+| **Antigravity CLI** | Soft | Security system prompt only |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
+| **Cursor CLI** | Not enforced (v2026) | `allowedTools` is currently ignored — no native flag or system-prompt path is active; see [Cursor CLI Tool Restrictions](cursor-cli.md#tool-restrictions) |
 
 **Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime.
 

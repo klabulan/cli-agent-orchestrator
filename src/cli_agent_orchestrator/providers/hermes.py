@@ -120,10 +120,13 @@ class HermesProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see _build_hermes_command.
+        self._model = model
         self._last_idle_timer: Optional[str] = None
         self._stable_idle_timer_count = 0
 
@@ -157,8 +160,12 @@ class HermesProvider(BaseProvider):
             "cao",
         ]
 
-        if profile and profile.model:
-            command_parts.extend(["--model", profile.model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given.
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
         if self._skill_prompt:
             logger.warning(
@@ -198,8 +205,9 @@ class HermesProvider(BaseProvider):
         """Get Hermes status by analyzing the terminal output buffer.
 
         Args:
-            output: Terminal output buffer (up to ~8KB rolling buffer) supplied
-                by the StatusMonitor via the FIFO reader pipeline.
+            output: Terminal output buffer (rolling buffer, up to
+                ``state_buffer_max`` bytes -- server setting, 32KB default)
+                supplied by the StatusMonitor via the FIFO reader pipeline.
         """
         # Native status (herdr): trust the backend's agent state when available.
         # Must precede the empty-buffer -> ERROR default below: on herdr the

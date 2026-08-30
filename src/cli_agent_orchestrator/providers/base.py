@@ -196,7 +196,8 @@ class BaseProvider(ABC):
         its get_status) and must NOT be "fixed" to comply.
 
         Args:
-            buffer: Raw terminal output (up to ~8KB rolling buffer).
+            buffer: Raw terminal output (rolling buffer, up to ``state_buffer_max``
+                bytes -- server setting, 32KB default).
 
         Returns:
             TerminalStatus - always returns a valid status.
@@ -211,6 +212,13 @@ class BaseProvider(ABC):
     # if CAO_PYTE_STATUS is on — protecting providers (and kiro_cli, which
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # Set True on providers whose get_status() detector is line-oriented and
+    # works correctly on a rendered capture-pane snapshot. Providers whose
+    # get_status() relies on dispatch bookkeeping (e.g. kiro_cli) must leave
+    # this False — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe: bool = False
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).

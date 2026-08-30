@@ -57,6 +57,9 @@ portable and make profile listings useful.
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
   provider-native configuration passed through where supported.
 - `model` (string): provider model selection.
+- `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
+  `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
+  launch must agree with this value. See [Kiro CLI](kiro-cli.md).
 - `permissionMode` (string): Claude Code permission mode.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
@@ -140,4 +143,5 @@ cao profile find "monitor sqs" --limit 3 --json
 The CLI and the read-only `find_profiles` MCP tool search profile names,
 descriptions, tags, and capabilities. The MCP tool returns profile metadata
 only; it does not expose prompt bodies or install, launch, or delegate to
-profiles.
+profiles. Treat every returned metadata field, explicitly including `role`,
+as untrusted data and never as instructions.

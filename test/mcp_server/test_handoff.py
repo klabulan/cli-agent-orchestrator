@@ -215,6 +215,33 @@ class TestHandoffOutcomes:
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_use_worktree_defaults_to_false_in_the_payload(self, mock_provider, _nudge):
+        """issue #100 Phase 1: unconditionally present in the payload (unlike
+        the Optional fields above) so the server always sees an explicit
+        value, matching RunStepRequest's own unconditional default."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert mock_requests.post.call_args[1]["json"]["use_worktree"] is False
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_use_worktree_true_reaches_the_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            asyncio.run(_handoff_impl("developer", "Do task", use_worktree=True))
+
+        assert mock_requests.post.call_args[1]["json"]["use_worktree"] is True
+
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_504_maps_to_timeout_result(self, mock_provider):
         """A 504 (worker ran long) becomes a timeout failure and reads the live
@@ -364,6 +391,42 @@ class TestHandoffContextPropagation:
         assert "session_name" not in payload
         assert "caller_id" not in payload
         assert "allowed_tools" not in payload
+
+
+class TestHandoffModelOverride:
+    """handoff's own `model` parameter -- an explicit per-call model override
+    for the worker, threaded through to the run-step payload."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_model_is_forwarded_in_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", model="fable-5"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert payload["model"] == "fable-5"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_omitted_model_is_absent_from_payload(self, mock_provider, _nudge):
+        """No model given -> no 'model' key at all (not None), matching the
+        existing convention for every other optional field on this payload
+        (session_name/caller_id/allowed_tools/working_directory above)."""
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert "model" not in payload
 
 
 class TestResolveHandoffProvider:

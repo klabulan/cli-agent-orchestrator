@@ -4,6 +4,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
@@ -31,7 +32,11 @@ class TestCreateSession:
         await create_session(provider=None, agent_profile="my_agent")
 
         mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
-        assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
+        call_kwargs = mock_create_terminal.call_args.kwargs
+        assert call_kwargs["provider"] == "claude_code"
+        assert call_kwargs["defer_init"] is False
+        assert call_kwargs["initial_message"] is None
+        assert call_kwargs["model"] is None
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
@@ -49,6 +54,64 @@ class TestCreateSession:
 
         mock_resolve.assert_not_called()
         assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_launch_payload(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        """A first task selects the existing deferred-init path and reaches
+        terminal creation alongside the model override."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(
+            provider="codex",
+            agent_profile="my_agent",
+            session_name="cao-test",
+            initial_message="Review the current change",
+            initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
+            model="gpt-5.1-codex",
+        )
+
+        call_kwargs = mock_create_terminal.call_args.kwargs
+        assert call_kwargs["new_session"] is True
+        assert call_kwargs["defer_init"] is True
+        assert call_kwargs["initial_message"] == "Review the current change"
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_rejects_orchestration_type_without_message(
+        self, mock_create_terminal
+    ):
+        """An incomplete initial-message payload fails instead of being dropped."""
+        with pytest.raises(
+            ValueError, match="initial_message_orchestration_type requires initial_message"
+        ):
+            await create_session(
+                provider="codex",
+                agent_profile="my_agent",
+                initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+
+        mock_create_terminal.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_rejects_empty_initial_message(self, mock_create_terminal):
+        """Direct callers cannot turn an empty first task into deferred initialization."""
+        with pytest.raises(ValueError, match="initial_message must not be empty"):
+            await create_session(
+                provider="codex",
+                agent_profile="my_agent",
+                initial_message="",
+            )
+
+        mock_create_terminal.assert_not_called()
 
 
 class TestListSessions:
@@ -152,14 +215,56 @@ class TestGetSession:
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             get_session("cao-nonexistent")
 
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_get_session_not_in_list(self, mock_get_backend):
-        """Test getting session that exists but not in list."""
-        mock_get_backend.return_value.session_exists.return_value = True
-        mock_get_backend.return_value.list_sessions.return_value = []
+    def test_get_session_confirmed_live_but_absent_from_list_is_not_a_404(
+        self, mock_get_backend, mock_list_terminals, mock_get_status
+    ):
+        """harness-control#840 REGRESSION: a session session_exists() confirms LIVE but that a
+        transient list_sessions() snapshot came back WITHOUT (TmuxClient.list_sessions swallows a
+        transient tmux error to []) must NOT 404. The pre-fix code raised "not found" here -- that
+        spurious "listed but detail 404s" was the exact signal the harness-control gateway read as
+        substrate loss and tore live sessions down on (12 fatal give-ups, 2026-08-13). The session
+        is returned (status synthesized as 'detached'), with its terminals intact."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-        with pytest.raises(ValueError, match="Session 'cao-test' not found"):
-            get_session("cao-test")
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = []  # transient empty snapshot
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-test"}]
+        mock_get_status.return_value = TerminalStatus.PROCESSING
+
+        result = get_session("cao-test")
+
+        # Confirmed-live session is returned, NOT 404'd.
+        assert result["session"]["id"] == "cao-test"
+        assert result["session"]["name"] == "cao-test"
+        assert result["session"]["status"] == "detached"  # synthesized cosmetic default
+        # Terminals are still resolved and status-enriched -- the whole point is a fully usable
+        # detail response, not a degraded stub.
+        assert len(result["terminals"]) == 1
+        assert result["terminals"][0]["status"] == "processing"
+
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_prefers_real_listing_record_when_present(
+        self, mock_get_backend, mock_list_terminals, mock_get_status
+    ):
+        """The #840 synthesis is a fallback ONLY: when the session IS in the listing, its real
+        record (real status etc.) is used, not the synthesized stub."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "cao-test", "status": "active"}
+        ]
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-test"}]
+        mock_get_status.return_value = TerminalStatus.IDLE
+
+        result = get_session("cao-test")
+
+        assert result["session"]["status"] == "active"  # real record, not the synthesized default
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_error(self, mock_get_backend):

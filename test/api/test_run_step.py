@@ -41,6 +41,91 @@ class TestRunStepEndpoint:
         assert kwargs["provider"] == "kiro_cli"
         assert kwargs["agent"] == "developer"
         assert kwargs["prompt"] == "do it"
+        assert kwargs["model"] is None
+
+    def test_model_forwarded_to_substrate(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(model="fable-5"))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["model"] == "fable-5"
+
+    @pytest.mark.parametrize(
+        "bad_model",
+        [
+            "fable-5\nrm -rf /",  # newline -- delivery hazard, not word-splitting
+            "fable\x00-5",  # NUL
+            "fable 5",  # whitespace
+            "fable;5",  # shell metacharacter
+            "x" * 129,  # exceeds MODEL_ID_MAX_LEN (128)
+        ],
+    )
+    def test_invalid_model_returns_422_and_never_reaches_the_substrate(self, client, bad_model):
+        """PR #501 review: a control character/newline/metacharacter in
+        model must be rejected at the request boundary, not merely arrive
+        shlex-quoted at a provider's launch command."""
+        with patch(_RUN_STEP, new=AsyncMock()) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(model=bad_model))
+
+        assert resp.status_code == 422
+        m_run.assert_not_awaited()
+
+    def test_valid_model_with_slash_and_dots_is_accepted(self, client):
+        """OpenCode's "vendor/model" form, and dotted version suffixes, must
+        not be rejected by the boundary check."""
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE, json=_body(model="anthropic/claude-3.5-sonnet")
+            )
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["model"] == "anthropic/claude-3.5-sonnet"
+
+    def test_explicit_model_null_is_accepted_same_as_omitted(self, client):
+        """Regression: Pydantic v2 does not run field_validators on a field
+        that falls back to its default (validate_default=False, the
+        default) -- so `model` omitted entirely never exercises
+        validate_model's `if v is None` branch. An explicit `"model": null`
+        in the request body does exercise it, and must be accepted exactly
+        like omitting the field."""
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(model=None))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["model"] is None
+
+    def test_matching_v2_reuse_constraints_are_forwarded(self, client):
+        result = AgentStepResult(
+            terminal_id="existing-v2",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(reuse_terminal_id="existing-v2", engine="v2"),
+            )
+
+        assert resp.status_code == 200
+        kwargs = m_run.await_args.kwargs
+        assert kwargs["reuse_terminal_id"] == "existing-v2"
+        assert kwargs["engine"] == "v2"
+
+    def test_invalid_engine_is_422(self, client):
+        with patch(_RUN_STEP, new=AsyncMock()) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v3"))
+
+        assert resp.status_code == 422
+        m_run.assert_not_awaited()
 
     def test_timeout_maps_to_504_with_structured_terminal_id(self, client):
         with patch(
@@ -144,3 +229,42 @@ class TestRunStepEndpoint:
         # Pydantic request-model validation rejects a missing prompt.
         resp = client.post(TERMINALS_RUN_STEP_ROUTE, json={"provider": "p", "agent": "a"})
         assert resp.status_code == 422
+
+    def test_use_worktree_defaults_to_false_and_is_forwarded(self, client):
+        """issue #100 Phase 1: the field is unconditionally forwarded (not
+        omitted-when-falsy like the Optional fields above), so a caller that
+        never mentions it still gets an explicit False into run_agent_step --
+        no ambiguity between 'not set' and 'set to false'."""
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["use_worktree"] is False
+
+    def test_use_worktree_true_is_forwarded(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(use_worktree=True))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["use_worktree"] is True
+
+    def test_worktree_error_maps_to_400_not_500(self, client):
+        """A working_directory that isn't a git repo (or a failed
+        'git worktree add') is a client-input problem, not a server crash --
+        distinct from the generic 500 fallback."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(side_effect=WorktreeError("'/tmp/x' is not inside a git repository")),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(use_worktree=True))
+
+        assert resp.status_code == 400
+        assert "not inside a git repository" in resp.json()["detail"]

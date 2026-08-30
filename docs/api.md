@@ -38,7 +38,30 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
-- `/agents/profiles*` lists, reads, and installs profiles.
+- `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
+  installed profiles.
+- `GET /agents/profiles/search` ranks installed, loadable profiles by capability
+  using the same service as `cao profile find`.
+- `GET /agents/profiles/templates` lists public template metadata (`name` and
+  `description` only); internal template filesystem paths are never returned.
+- `GET /agents/profiles/templates/{category}/{name}/schema` returns a template's
+  JSON-Schema.
+- `POST /agents/profiles/templates/validate` validates a config object against
+  a template's JSON-Schema without writing a profile.
+- `POST /agents/profiles/templates/preview` validates and renders a template to
+  Markdown without writing a profile.
+- `POST /agents/profiles/validate` validates a finished profile's frontmatter
+  against the profile JSON-Schema plus CAO conventions, without writing
+  anything. This is the HTTP equivalent of `cao profile validate`, and is
+  distinct from `templates/validate`, which checks a template *config* against
+  that template's own schema. Findings are severity-tagged (`error` or
+  `warning`); only errors clear the `valid` flag, so warnings are advisory.
+- `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
+  client can render create and edit forms from the server's definition instead
+  of duplicating the field list.
+- `POST /agents/profiles/install` installs a profile.
+- Template validation and preview require the selected template to include a
+  `schema.json` file.
 - `/agents/providers` reports provider availability.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
@@ -58,6 +81,46 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
+  rolling buffer (most recent `state_buffer_max` bytes of streamed output —
+  server setting, 32KB by default, see [Configuration](configuration.md)),
+  not unbounded scrollback. Long sessions are truncated to the tail; use the
+  on-disk terminal log for complete history.
+- Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
+  Phase 1): provisions an isolated `git worktree` on its own branch instead of
+  sharing `working_directory` as given, requiring the resolved directory to be
+  inside a git repository. At deletion, the worktree's working-tree contents
+  are always discarded, but the branch is only deleted if it has no unmerged
+  commits — commit and merge/push results before the terminal is deleted if
+  they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
+  the full behavior.
+- `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
+  session's initial terminal into peer discovery (a mid-session worker uses
+  `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
+  `group` is an ordered, general-to-specific array (e.g.
+  `["tenant_1", "project_5"]`); `metadata` is a free-form JSON object the
+  running agent updates via the `update_metadata` MCP tool. Both PATCH
+  endpoints are whole-value replace, not merge, last-write-wins under
+  concurrent calls, and reject an omitted field with `422` (an explicit
+  `null`/`[]`/`{}` clears the value; omitting it does not).
+- `GET /terminals/{terminal_id}/siblings` lists other terminals sharing a
+  leading prefix of `terminal_id`'s own `group`, optionally narrowed by
+  `depth`; a caller can never see a wider scope than its own group, and a
+  terminal with no `group` set finds no siblings. Session-scoped by default
+  — results are also filtered to the caller's own tmux session unless the
+  explicit `cross_session=true` opt-in is passed. Sibling `metadata` is
+  agent-authored, untrusted content — same trust domain as an inbound
+  `send_message` body. The `list_siblings`/`update_metadata` MCP tools also
+  require the `discovery` entry in `allowedTools` — a separate opt-in from
+  orchestration tools, not bundled into `@cao-mcp-server` — see
+  [Tool Restrictions](tool-restrictions.md) and
+  [Discovery Tool Coexistence](discovery-tool-coexistence.md).
+
+**`group` is an organizational label, not a security boundary.** On a
+default install with auth disabled, a worker already has local shell access
+to this API, so `group`/`discovery`/session-scoping provide no tenant
+isolation or access-control guarantee even used together — do not build a
+security boundary on top of them.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
@@ -74,18 +137,67 @@ than calling these routes directly.
 ### Workflows
 
 - `/workflows*` validates and inspects workflow specifications.
-- `/workflows/runs*` starts, inspects, cancels, and resumes runs and retrieves
-  run output.
+- `POST /workflows/runs` starts a run **inline** and holds the connection until it
+  finishes, returning the complete result.
+- `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
+  `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
+  the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
+  `events` appears only on a build that serves the events route, so treat it as optional.
+- `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
+- `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
+  each step's durable projection — including the step's full `output_json` and
+  `error` text. ⚠️ This is the most payload-bearing read on the surface, and the
+  output it returns is **not** gated by `workflow_journal_capture_output`; see the
+  retention note in [Configuration](configuration.md#memory-memory). It is a
+  superset of the older status-snapshot shape, so callers reading only
+  `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
+- `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
+  assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
+  run — not only a finished one. No run-level `output` field is returned (run-level output
+  is not journaled); per-step outputs are on `steps[].output`.
+- `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
+  `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
+- `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
+  any **declared** gaps. One content-negotiated path, two arms: send
+  `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
+  JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
+  takes precedence over `Last-Event-ID`. A gap is data the server declares when an
+  append was lost — never inferred by the client from seq numbering.
+- `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
+  differences between two runs. Outputs are compared at the reference level, never by
+  diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
+- `GET /workflows/runs/{run_id}/diagnostics` returns a troubleshooting bundle: spec
+  identifier + content hash, sanitized inputs, the event timeline with declared gaps,
+  step outcomes, provider/agent/engine environment, and terminal/artifact references.
+  Output excerpts appear only when `workflow_journal_capture_output` is on;
+  `capture_enabled` in the body declares which posture produced the bundle.
+- `DELETE /workflows/runs/{run_id}` removes a run and all its retained data (run row,
+  steps, events, seq high-water) in one cascade. Requires a write or admin scope.
+  A **running** run returns 409 — cancel it first; an already-absent run returns 204.
+- `GET /terminals/{id}/output/range?start=&length=` reads a byte-exact window of a
+  terminal's append-only log, for correlating a step with the terminal output it
+  produced. `length` is capped server-side.
+
+All five reads above (inspect, events, compare, diagnostics, and the run list)
+require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
+enabled**. With `CAO_AUTH_ENABLED` unset — the default — that check is inert.
 
 See [Workflows](workflows.md).
 
 ### Memory and graph
 
-- `/settings/memory` reports memory enablement.
+- `/settings/memory` reports memory enablement (including `learning_enabled`).
 - `/memory*` lists, reads, exports, and deletes memories.
+- `/memory/relationships*` lists, creates, patches, promotes, rejects, and
+  soft-deletes typed relationships between memories. `GET` is read-scoped and
+  capped by `limit` (default 50, max 100); the mutating routes are write-scoped.
+  `DELETE` is a soft-delete — the row is retained with `status=deleted`.
 - `/graph/{provider}*` projects and exports graph views.
+- `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
+  outcomes for the self-learning loop. Both return 404 while
+  `memory.learning_enabled` is false.
 
-See [Memory](memory.md) and
+See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).
 
 ### Flows
