@@ -21,6 +21,7 @@ not assumed.
 """
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -37,16 +38,30 @@ BLOCK_SECONDS = 2.0
 MAX_HEALTH_SECONDS = 0.75
 
 
-async def _health_latency_during(path: str) -> float:
-    """Fire `path` (slow), then time an unrelated /health while it is still running."""
+async def _health_latency_during(path: str, entered: threading.Event) -> float:
+    """Time from firing a slow request to getting an unrelated /health back.
+
+    The timing here is deliberate and was got WRONG first: an earlier version recorded the start
+    time AFTER an ``await asyncio.sleep(...)`` intended to "let the slow request begin". But if
+    the loop is blocked, that sleep cannot resume until the blocking call has already FINISHED --
+    so the clock started after the stall was over and /health looked fast either way. That version
+    passed identically with and without the fix. It measured nothing.
+
+    So: ``t0`` is taken BEFORE the slow request is created, and everything is measured against it.
+    ``entered`` is set by the fake service function itself, from whichever thread runs it, which
+    guarantees the slow handler really is in its blocking section before /health is issued -- so a
+    fast result cannot be an artifact of /health simply winning a race to run first.
+    """
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        t0 = time.monotonic()
         slow = asyncio.create_task(client.get(path))
-        # Let the slow request actually enter its handler before timing anything.
-        await asyncio.sleep(0.15)
-        started = time.monotonic()
+        # Poll rather than sleep a fixed amount. If the loop IS blocked this cannot resume until
+        # the block ends, which is exactly the signal we want folded into the elapsed time.
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
         resp = await client.get("/health")
-        elapsed = time.monotonic() - started
+        elapsed = time.monotonic() - t0
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "ok"
         await slow
@@ -57,12 +72,15 @@ async def _health_latency_during(path: str) -> float:
 async def test_get_session_does_not_block_health(monkeypatch):
     """GET /sessions/{name} -- 55% of production request volume, the largest stall source."""
 
+    entered = threading.Event()
+
     def slow_get_session(session_name):
+        entered.set()
         time.sleep(BLOCK_SECONDS)  # stands in for the real blocking tmux subprocess call
         return {"session": {"id": session_name}, "terminals": []}
 
     monkeypatch.setattr(main.session_service, "get_session", slow_get_session)
-    elapsed = await _health_latency_during("/sessions/cao-test")
+    elapsed = await _health_latency_during("/sessions/cao-test", entered)
     assert elapsed < MAX_HEALTH_SECONDS, (
         f"/health took {elapsed:.2f}s while GET /sessions/{{name}} was in a "
         f"{BLOCK_SECONDS}s synchronous call -- the event loop is blocked"
@@ -71,12 +89,15 @@ async def test_get_session_does_not_block_health(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_sessions_does_not_block_health(monkeypatch):
+    entered = threading.Event()
+
     def slow_list_sessions():
+        entered.set()
         time.sleep(BLOCK_SECONDS)
         return []
 
     monkeypatch.setattr(main.session_service, "list_sessions", slow_list_sessions)
-    elapsed = await _health_latency_during("/sessions")
+    elapsed = await _health_latency_during("/sessions", entered)
     assert elapsed < MAX_HEALTH_SECONDS, (
         f"/health took {elapsed:.2f}s while GET /sessions was in a "
         f"{BLOCK_SECONDS}s synchronous call -- the event loop is blocked"
@@ -85,14 +106,17 @@ async def test_list_sessions_does_not_block_health(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_working_directory_does_not_block_health(monkeypatch):
+    entered = threading.Event()
+
     def slow_get_working_directory(terminal_id):
+        entered.set()
         time.sleep(BLOCK_SECONDS)
         return "/tmp"
 
     monkeypatch.setattr(
         main.terminal_service, "get_working_directory", slow_get_working_directory
     )
-    elapsed = await _health_latency_during("/terminals/abcd1234/working-directory")
+    elapsed = await _health_latency_during("/terminals/abcd1234/working-directory", entered)
     assert elapsed < MAX_HEALTH_SECONDS, (
         f"/health took {elapsed:.2f}s while GET /terminals/{{id}}/working-directory was in a "
         f"{BLOCK_SECONDS}s synchronous call -- the event loop is blocked"
