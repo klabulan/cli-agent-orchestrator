@@ -1852,7 +1852,18 @@ async def create_session(
 @app.get("/sessions")
 async def list_sessions() -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        # harness-control#1283: OFF THE EVENT LOOP. This handler is `async def` but
+        # session_service/terminal_service are fully synchronous and shell out to tmux
+        # (subprocess spawn + blocking poll(2)), so running them inline blocks the ENTIRE
+        # server for the duration -- /health included. Same hazard class as issue #382,
+        # which was fixed only for DELETE /sessions and POST /terminals/{id}/input.
+        #
+        # Measured on a production box, 2026-09-14: the event-loop thread spent 58.5% of its
+        # wall-clock blocked in poll(2) inside subprocess.communicate() and only 24.5% in
+        # epoll; across 165 samples taken during a /health stall it reached epoll ZERO times.
+        # /health p95 was 7.67s and p99 9.46s against a p50 of 2.2ms -- strictly bimodal,
+        # which is the signature of head-of-line blocking, not of slow work.
+        return await asyncio.to_thread(session_service.list_sessions)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1869,7 +1880,14 @@ async def get_session(session_name: str) -> Dict:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # harness-control#1283: OFF THE EVENT LOOP -- see the banner on GET /sessions.
+        # This endpoint is the single largest source of the stall: 55% of production request
+        # volume (11,019 of 20,000 consecutive access-log lines), at 116-221ms end-to-end each,
+        # fanned out by the harness-control gateway across every session concurrently. It is
+        # also O(N) in the session count on its own, because session_service.get_session calls
+        # list_sessions() internally -- so a fan-out over N sessions does O(N^2) tmux work, all
+        # of it previously serialised on this one event loop.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2185,7 +2203,10 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
         svc = MemoryService()
-        context = svc.get_memory_context_for_terminal(terminal_id)
+        # harness-control#1283: OFF THE EVENT LOOP -- see the banner on GET /sessions. Lower
+        # traffic than the three above, but the same synchronous-work-on-the-loop shape, and
+        # left inline it would remain a stall source after the others are fixed.
+        context = await asyncio.to_thread(svc.get_memory_context_for_terminal, terminal_id)
         return PlainTextResponse(content=context)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2200,7 +2221,11 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        # harness-control#1283: OFF THE EVENT LOOP -- see the banner on GET /sessions.
+        # 1,305 of the same 20,000 access-log lines.
+        working_directory = await asyncio.to_thread(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
