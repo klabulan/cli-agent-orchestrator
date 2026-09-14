@@ -105,6 +105,30 @@ async def test_list_sessions_does_not_block_health(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_memory_context_does_not_block_health(monkeypatch):
+    """The 4th wrap. Added after review: per-handler mutation showed reverting this one left the
+    other three passing, i.e. it had NO coverage. The 19->23 to_thread count check proved only
+    that a number moved, never which four lines moved -- the same shape as a green check whose
+    population was empty."""
+    from cli_agent_orchestrator.services import memory_service
+
+    entered = threading.Event()
+
+    class _SlowMemoryService:
+        def get_memory_context_for_terminal(self, terminal_id):
+            entered.set()
+            time.sleep(BLOCK_SECONDS)
+            return "ctx"
+
+    monkeypatch.setattr(memory_service, "MemoryService", lambda *a, **k: _SlowMemoryService())
+    elapsed = await _health_latency_during("/terminals/abcd1234/memory-context", entered)
+    assert elapsed < MAX_HEALTH_SECONDS, (
+        f"/health took {elapsed:.2f}s while GET /terminals/{{id}}/memory-context was in a "
+        f"{BLOCK_SECONDS}s synchronous call -- the event loop is blocked"
+    )
+
+
+@pytest.mark.asyncio
 async def test_working_directory_does_not_block_health(monkeypatch):
     entered = threading.Event()
 
