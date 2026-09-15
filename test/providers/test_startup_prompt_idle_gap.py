@@ -54,33 +54,42 @@ class TestClaudeCodeIdleGap:
     def _make(self):
         return ClaudeCodeProvider("t1", "sess", "win")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_late_prompt_handled(self, mock_backend, mock_time):
+    async def test_late_prompt_handled(self, mock_backend, mock_time, mock_asyncio_sleep):
         """A prompt at t=35s (past the old 20s window) is still handled.
 
         Two prompts: bypass at t=18 resets the idle timer; the trust prompt at
         t=35 is within idle_gap of that reset (35-18=17 < 20) so it is still
         answered. Under the old fixed-window logic the handler would have exited
         at t=20 and never seen the trust prompt.
+
+        workain/harness-control#225: trust no longer returns immediately (the
+        fullscreen-renderer upsell can follow it) -- accepting it resets
+        last_prompt_time via its own monotonic() call, and a 3rd poll (a plain
+        "Welcome to" banner) is needed for a deterministic return afterward.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
             18.0,  # iter1 now: gap=18<20, bypass prompt → handled
             18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
-            35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled → return
+            35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled, timer reset
+            35.0,  # last_prompt_time reset to 35 (trust's own branch)
+            40.0,  # iter3 now: gap=40-35=5<20 -> banner seen -> return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code",
         ]
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         # Bypass at t=18 (Down + Enter) and the late trust prompt at t=35 (Enter)
         # are both handled — proving the idle-gap reset kept the loop polling past
@@ -88,10 +97,14 @@ class TestClaudeCodeIdleGap:
         assert mock_backend.send_keys.call_count == 1  # bypass Down arrow
         assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_no_prompt_exits_at_outer_cap_not_idle_gap(self, mock_backend, mock_time):
+    async def test_no_prompt_exits_at_outer_cap_not_idle_gap(
+        self, mock_backend, mock_time, mock_asyncio_sleep
+    ):
         """No prompt ever appears — the idle gap does NOT apply until a first prompt lands.
 
         Before any prompt is observed, ``last_prompt_time`` has nothing real to
@@ -99,7 +112,6 @@ class TestClaudeCodeIdleGap:
         should-fix-3 rework: the exit at t=25 (old idle-gap boundary) must NOT
         fire here — only t=61 (past the 60s outer cap) does.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
@@ -110,16 +122,20 @@ class TestClaudeCodeIdleGap:
         mock_backend.get_history.return_value = "Loading..."
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         # No prompts handled
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_first_prompt_later_than_idle_gap_still_handled(self, mock_backend, mock_time):
+    async def test_first_prompt_later_than_idle_gap_still_handled(
+        self, mock_backend, mock_time, mock_asyncio_sleep
+    ):
         """A FIRST dialog later than idle_gap (the issue #400 scenario) is now caught.
 
         Before this fix, a first prompt at t=35 (past the 20s idle-gap default)
@@ -127,25 +143,34 @@ class TestClaudeCodeIdleGap:
         from a real prompt, and exited at t=20. Now the idle-gap clock only
         starts once a prompt has actually been handled, so a first prompt at
         t=35 is well within the still-open outer cap and is handled.
+
+        workain/harness-control#225: trust no longer returns immediately -- a 2nd
+        poll (a plain "Welcome to" banner) is needed for a deterministic return.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
             35.0,  # iter1 now: no prompt handled yet -> idle-gap check skipped ->
-            # trust prompt found in output -> handled -> return
+            # trust prompt found in output -> handled, timer reset
+            35.0,  # last_prompt_time reset to 35 (trust's own branch)
+            40.0,  # iter2 now: gap=40-35=5<20 -> banner seen -> return
         ]
-        mock_backend.get_history.return_value = "Yes, I trust this folder"
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder",
+            "Welcome to Claude Code",
+        ]
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         mock_backend.send_special_key.assert_called_once_with("sess", "win", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _outer_cap_settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_outer_cap_respected(self, mock_backend, mock_time):
+    async def test_outer_cap_respected(self, mock_backend, mock_time, mock_asyncio_sleep):
         """Loop exits at provider_init_timeout, NOT via the idle gap.
 
         idle_gap=100 > provider_init_timeout=60, so the idle-gap check can never
@@ -153,7 +178,6 @@ class TestClaudeCodeIdleGap:
         bypass prompt is handled once (resetting the timer), then the loop idles
         until t=61 trips the outer cap.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
@@ -169,45 +193,50 @@ class TestClaudeCodeIdleGap:
         )
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         # Bypass accepted once
         mock_backend.send_keys.assert_called_once()
         mock_backend.send_special_key.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_cascading_prompts_all_handled(self, mock_backend, mock_time):
+    async def test_cascading_prompts_all_handled(self, mock_backend, mock_time, mock_asyncio_sleep):
         """Multiple prompts in sequence — bypass then trust, both handled."""
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
             3.0,  # iter1: gap=3<20, bypass prompt → handled
             3.0,  # last_prompt_time reset
             # loop continues
-            8.0,  # iter2: gap=8-3=5<20, trust prompt → handled → return
+            8.0,  # iter2: gap=8-3=5<20, trust prompt → handled, timer reset
+            8.0,  # last_prompt_time reset to 8 (trust's own branch)
+            12.0,  # iter3: gap=12-8=4<20 -> banner seen -> return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code",
         ]
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         # Bypass: send_keys (Down arrow) + send_special_key (Enter)
         # Trust: send_special_key (Enter)
         assert mock_backend.send_keys.call_count == 1
         assert mock_backend.send_special_key.call_count == 2
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_idle_gap_resets_on_each_prompt(self, mock_backend, mock_time):
+    async def test_idle_gap_resets_on_each_prompt(self, mock_backend, mock_time, mock_asyncio_sleep):
         """First prompt at t=5s resets timer; second at t=22s still within gap of first."""
-        mock_time.sleep = MagicMock()
         # idle_gap=20. First prompt at t=5, resets last_prompt_time to 5.
         # Second prompt at t=22: gap=22-5=17<20, so still polled and handled.
         # Without reset, gap would be 22-0=22>=20 → would have exited.
@@ -217,15 +246,18 @@ class TestClaudeCodeIdleGap:
             5.0,  # iter1: gap=5<20, bypass prompt → handled
             5.0,  # last_prompt_time reset to 5
             # continues
-            22.0,  # iter2: gap=22-5=17<20, trust prompt → handled → return
+            22.0,  # iter2: gap=22-5=17<20, trust prompt → handled, timer reset
+            22.0,  # last_prompt_time reset to 22 (trust's own branch)
+            26.0,  # iter3: gap=26-22=4<20 -> banner seen -> return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
             "Yes, I trust this folder",
+            "Welcome to Claude Code",
         ]
 
         p = self._make()
-        p._handle_startup_prompts()
+        await p._handle_startup_prompts()
 
         # Both prompts handled
         assert mock_backend.send_keys.call_count == 1  # bypass Down arrow

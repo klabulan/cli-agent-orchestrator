@@ -216,11 +216,16 @@ class ClaudeCodeProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model (see launch()'s own
+        # --model resolution below) -- e.g. a handoff/assign caller pinning a
+        # specific model for one worker without needing a dedicated profile.
+        self._model = model
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -331,7 +336,16 @@ class ClaudeCodeProvider(BaseProvider):
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
             # Thin wrapper: CAO profile maps to a native Claude Code agent.
-            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model)
+            # -- self._model (whether sourced from an explicit per-call override
+            # or from this same profile's own model field, see
+            # terminal_service.create_terminal's own precedence resolution) is
+            # deliberately NOT applied here, same as it was never applied for
+            # profile.model alone before this parameter existed. Not warned on:
+            # by the time this runs, self._model can no longer be distinguished
+            # from "this profile's own model field, nothing to do with a caller
+            # override at all" -- warning here would misattribute ordinary
+            # profile config as an ignored explicit request.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
         elif self._agent_profile is not None and profile is None:
@@ -339,10 +353,18 @@ class ClaudeCodeProvider(BaseProvider):
             # native agent store (~/.claude/agents/). Same thin-orchestrator
             # pattern as the Kiro CLI provider.
             command_parts.extend(["--agent", self._agent_profile])
+            if self._model:
+                command_parts.extend(["--model", self._model])
         elif profile is not None:
-            # Full CAO profile with config decomposition
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+            # Full CAO profile with config decomposition. self._model is an
+            # explicit per-call override (handoff/assign's own `model`
+            # parameter) and wins over the profile's own static model field
+            # when both are given -- a caller pinning a one-off model for a
+            # single worker shouldn't need a dedicated agent profile just to
+            # do it.
+            resolved_model = self._model or profile.model
+            if resolved_model:
+                command_parts.extend(["--model", resolved_model])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
@@ -428,14 +450,27 @@ class ClaudeCodeProvider(BaseProvider):
         return f"{unset_cmd}; {claude_cmd}"
 
     @staticmethod
-    def _ensure_skip_bypass_prompt_setting() -> None:
-        """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
+    def _ensure_startup_settings() -> None:
+        """Ensure ``~/.claude/settings.json`` has the settings that suppress CLI prompts CAO
+        never wants to see, so the settings-based fix is what prevents them, not runtime
+        detect-and-dismiss.
 
-        Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
-        on every launch with ``--dangerously-skip-permissions`` unless
-        ``skipDangerousModePermissionPrompt: true`` is persisted in
-        ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
-        so the confirmation is redundant and blocks initialization.
+        - ``skipDangerousModePermissionPrompt: true``: Claude Code (v2.1.41+) shows a bypass
+          permissions confirmation dialog on every launch with
+          ``--dangerously-skip-permissions`` unless this is persisted. CAO already uses the
+          flag intentionally, so the confirmation is redundant and blocks initialization.
+        - ``tui: "default"``: Claude Code shows a first-run "Try the new fullscreen renderer?"
+          onboarding upsell (workain/harness-control#225) on a HOME dir whose stored
+          onboarding-version state lags the installed CLI, unless the CLI's own ``/tui``
+          setting is already explicitly set to something (either value -- ``"default"`` or
+          ``"fullscreen"``). ``"default"`` keeps the classic renderer this file's own
+          screen-scraping status detection already expects (get_status/wait_until_status parse
+          raw pane content; the CLI's real fullscreen mode uses the terminal's alternate
+          screen, which is untested against this file's own scraping and not something to
+          switch on as a side effect of dialog suppression). This replaces an earlier
+          runtime detect-and-dismiss approach (regex-matching the exact prompt text, then
+          injecting a keystroke to answer it) -- prevention beats reacting to a shape that
+          only exists at all because this setting was left unset.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
         settings: dict = {}
@@ -446,16 +481,23 @@ class ClaudeCodeProvider(BaseProvider):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if settings.get("skipDangerousModePermissionPrompt") is True:
+        changed = False
+        if settings.get("skipDangerousModePermissionPrompt") is not True:
+            settings["skipDangerousModePermissionPrompt"] = True
+            changed = True
+        if "tui" not in settings:
+            settings["tui"] = "default"
+            changed = True
+
+        if not changed:
             return
 
-        settings["skipDangerousModePermissionPrompt"] = True
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
-        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+        logger.info("Updated startup-prompt-suppressing settings in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(
+    async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
@@ -464,10 +506,16 @@ class ClaudeCodeProvider(BaseProvider):
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
-           The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
+           The settings-based fix (``_ensure_startup_settings``) prevents
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
+
+        The first-run "Try the new fullscreen renderer?" onboarding upsell
+        (workain/harness-control#225) is prevented from appearing at all rather than
+        detected-and-dismissed here: ``_ensure_startup_settings`` seeds ``tui: "default"``
+        into ``~/.claude/settings.json`` before launch, and the CLI's own gate for that prompt
+        skips it whenever ``tui`` is already explicitly set to anything.
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -487,6 +535,19 @@ class ClaudeCodeProvider(BaseProvider):
         any prompt has been observed, only ``outer_timeout`` can end the loop;
         the idle-gap clock starts only once a prompt has actually been handled.
 
+        workain/harness-control#215: this method is awaited directly from initialize(),
+        which itself runs on cao-server's single asyncio event loop (uvicorn is started
+        with no ``workers=``, so there is exactly one). Every tmux-backed call here
+        (``get_history``/``send_keys``/``send_special_key``) is a blocking subprocess
+        exec -- offloaded to a worker thread via ``asyncio.to_thread`` so none of them
+        block the loop, matching how ``wait_for_shell``/``wait_until_status`` already
+        behave. Live-reproduced upstream of this fix: N concurrent ``POST /sessions``
+        calls against an unpatched build produced per-request elapsed times that scaled
+        with N and converged on ``provider_init_timeout`` purely from this self-inflicted
+        queueing (every other terminal's own wait_for_shell/initialize/wait_until_status,
+        and unrelated endpoints like GET /health, frozen for as long as any ONE terminal's
+        own startup-prompt loop was running a plain ``time.sleep``).
+
         Args:
             idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
                 to the ``startup_prompt_handler_timeout`` setting.
@@ -503,6 +564,7 @@ class ClaudeCodeProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         bypass_accepted = False
+        trust_accepted = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -511,9 +573,11 @@ class ClaudeCodeProvider(BaseProvider):
             if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
 
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -526,26 +590,38 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(
-                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "\x1b[B",
+                    enter_count=0,
                 )
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 bypass_accepted = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()  # reset idle timer — trust prompt may follow
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
-            # 2) Handle workspace trust prompt
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            # 2) Handle workspace trust prompt.
+            if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
-                return
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
+                trust_accepted = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()
+                await asyncio.sleep(1.0)
+                continue
 
             # 3) Claude Code fully started — no prompts needed.
             #    The version banner is the ONLY reliable "ready" signal here: it
@@ -564,7 +640,7 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without prompts")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -581,7 +657,11 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        self._ensure_skip_bypass_prompt_setting()
+        # workain/harness-control#215 self-ROAST finding: this does blocking file I/O
+        # (~/.claude/settings.json read+write) directly on the event loop this coroutine
+        # runs on -- offloaded for the same reason as the calls below, so nothing in
+        # initialize() blocks the loop.
+        await asyncio.to_thread(self._ensure_startup_settings)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)
@@ -589,13 +669,18 @@ class ClaudeCodeProvider(BaseProvider):
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
         # PROCESSING transition past any stale ready latch.
+        # workain/harness-control#215: offloaded to a thread (see _handle_startup_prompts'
+        # own docstring) so this single subprocess exec can't add to the same
+        # event-loop-blocking pileup under concurrent session creation.
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Handle startup prompts (bypass permissions + workspace trust).
         # Pass the resolved timeout as the outer cap so a containerized profile's
         # longer init budget also governs the startup-prompt handler.
-        self._handle_startup_prompts(outer_timeout=init_timeout)
+        await self._handle_startup_prompts(outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup

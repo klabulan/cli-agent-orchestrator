@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -53,6 +54,8 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    MODEL_ID_MAX_LEN,
+    MODEL_ID_RE,
     OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
@@ -65,7 +68,8 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
@@ -130,6 +134,7 @@ logger = logging.getLogger(__name__)
 TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
+GRAPH_PROJECTION_TIMEOUT_S = 90.0
 
 
 async def flow_daemon():
@@ -202,6 +207,80 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+class CreateSessionBody(CreateTerminalBody):
+    """Optional JSON body for POST /sessions.
+
+    Reuses the terminal-creation message payload and keeps operator-forwarded
+    environment variables in the request body, preserving the existing
+    ``{"env_vars": {...}}`` wire shape. ``group``/``metadata`` (#432) live here
+    too rather than as separate ``Body(embed=True)`` params -- this endpoint
+    already has a non-embedded Pydantic body param (this class), and adding a
+    second/third embedded body param would change FastAPI's expected JSON
+    shape to `{"body": {...}, "group": [...], "metadata": {...}}`, breaking
+    every existing flat-body caller.
+    """
+
+    env_vars: Optional[Dict[str, str]] = None
+    group: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Ordered, general-to-specific grouping array for list_siblings "
+            'discovery (#432), e.g. ["tenant_1", "project_5", "folder_12"]. '
+            "Omit to opt this terminal out of group-based discovery."
+        ),
+    )
+    metadata: Optional[Dict] = Field(
+        default=None, description="Free-form JSON describing what this terminal is doing (#432)."
+    )
+
+
+def _validate_model_id(value: str) -> None:
+    """Validate a ``model`` override at the request boundary (PR #501 review).
+
+    Shared by ``RunStepRequest.model`` (field_validator below) and the
+    ``/sessions/{session_name}/terminals`` ``model`` query param, so both
+    entry points into ``terminal_service.create_terminal`` apply the same
+    rule. Raises ``ValueError``; callers translate that into the transport
+    -appropriate error (FastAPI 422 for a Pydantic field_validator, an
+    explicit 400 for the query-param call site — see that endpoint).
+
+    Raises:
+        ValueError: ``value`` exceeds MODEL_ID_MAX_LEN or contains a
+            character outside MODEL_ID_RE (whitespace, control characters,
+            and shell/quoting metacharacters are all rejected).
+    """
+    if len(value) > MODEL_ID_MAX_LEN:
+        raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
+    if not re.fullmatch(MODEL_ID_RE, value):
+        raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+class UpdateGroupBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/group`` (#432).
+
+    ``group`` is required (no default) so an omitted field is rejected with
+    422 rather than silently treated the same as an explicit ``null`` —
+    clearing the group is always an explicit choice (``null`` or ``[]``),
+    never an accident of a partial/empty body (Copilot review, PR #433).
+    """
+
+    group: Optional[List[str]]
+
+
+class UpdateMetadataBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/metadata`` (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool.
+
+    ``metadata`` is required (no default) for the same reason as
+    ``UpdateGroupBody.group`` above: an omitted field is rejected with 422
+    instead of being indistinguishable from an explicit clearing ``null``
+    (Copilot review, PR #433).
+    """
+
+    metadata: Optional[Dict]
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -237,6 +316,15 @@ class RunStepRequest(BaseModel):
             "Workflow identity env vars injected into a freshly created terminal. "
             "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
             "values are validated but never echoed in error bodies."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit per-call model override for a freshly created terminal "
+            "(ignored when reusing a terminal), applied ahead of the agent "
+            "profile's own static model field. Lets a caller pin a specific "
+            "model for one worker without a dedicated agent profile."
         ),
     )
 
@@ -282,6 +370,20 @@ class RunStepRequest(BaseModel):
                     f"value for '{key}' is invalid (must be a 1-64 char "
                     "[A-Za-z0-9_-] identifier)"
                 ) from None
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: Optional[str]) -> Optional[str]:
+        """See ``_validate_model_id`` -- the boundary check the model
+        override needs (PR #501 review): the value reaches a provider's
+        launch-command builder, shlex-quoted before delivery (so classic
+        word-splitting is not reachable) but a control character or newline
+        surviving quoting into the command string is still a delivery
+        hazard this codebase already guards against elsewhere."""
+        if v is None:
+            return v
+        _validate_model_id(v)
         return v
 
     @model_validator(mode="after")
@@ -473,6 +575,19 @@ def _reconcile_memory_at_startup() -> None:
             )
 
 
+def _seed_default_skills_at_startup() -> None:
+    """Seed newly packaged skills without overwriting an existing installation."""
+    try:
+        seeded_count = seed_default_skills()
+        if seeded_count:
+            logger.info("Seeded %d new builtin skill(s).", seeded_count)
+    except Exception as exc:
+        logger.warning(
+            "automatic builtin skill seeding failed (%s); run `cao init` to retry",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -490,6 +605,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
@@ -1616,7 +1732,8 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
-    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    model: Optional[str] = None,
+    body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
@@ -1628,11 +1745,29 @@ async def create_session(
     the curator reaches IDLE; ``get_curated_memory_context`` falls back to
     Phase 1 in that window.
 
-    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    ``body.env_vars`` is the optional operator-forwarded env map
     from ``cao launch --env``. It travels in the JSON body — not the query
     string — so values potentially containing secrets do not land in
     cao-server's HTTP access log. See issue #248.
+
+    When ``body.initial_message`` is present, session creation reuses the
+    existing deferred terminal-initialization path: the response is returned
+    after the session and terminal record are created, then provider
+    initialization and message delivery continue in the background. This
+    narrows the create-then-send window but is not a transactional operation;
+    deferred failures follow terminal_service's existing logging and best-
+    effort cleanup behavior.
+
+    ``model`` is an optional per-launch override. It uses the same validation
+    and provider handoff as the existing terminal-creation endpoint.
+
+    ``body.group``/``body.metadata`` (#432) set the new terminal's discovery
+    group and free-form metadata at creation time; see ``PATCH
+    /terminals/{id}/group``, ``PATCH /terminals/{id}/metadata`` and ``GET
+    /terminals/{id}/siblings`` for updating/querying them afterward.
     """
+    initial_message = body.initial_message if body else None
+    initial_message_orchestration_type = None
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -1648,6 +1783,22 @@ async def create_session(
                 else f"{SESSION_PREFIX}{session_name}"
             )
             validate_tmux_name(effective, "session_name")
+        if model is not None:
+            _validate_model_id(model)
+        if initial_message == "":
+            raise ValueError("initial_message must not be empty")
+        if body and body.initial_message_orchestration_type:
+            if initial_message is None:
+                raise ValueError("initial_message_orchestration_type requires initial_message")
+            try:
+                initial_message_orchestration_type = OrchestrationType(
+                    body.initial_message_orchestration_type
+                )
+            except ValueError:
+                raise ValueError(
+                    "invalid initial_message_orchestration_type: "
+                    f"{body.initial_message_orchestration_type!r}"
+                )
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -1658,7 +1809,12 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
-            env_vars=env_vars,
+            env_vars=body.env_vars if body else None,
+            initial_message=initial_message,
+            initial_message_orchestration_type=initial_message_orchestration_type,
+            model=model,
+            group=body.group if body else None,
+            metadata=body.metadata if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -1766,6 +1922,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    model: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1784,9 +1941,17 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``model``: optional explicit override, applied ahead of the agent
+    profile's own static ``model`` field (where the resolved provider
+    supports it -- see ``terminal_service.create_terminal``'s own docstring).
+    Lets a caller pin a specific model for one worker without needing a
+    dedicated agent profile.
     """
     try:
         validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -1847,6 +2012,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            model=model,
         )
         return result
     except HTTPException:
@@ -1898,6 +2064,111 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/group", response_model=Terminal)
+async def update_terminal_group_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateGroupBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's group array (#432).
+
+    Lets a consumer whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment,
+    harness-control#92) keep ``group`` from going stale. ``group`` is
+    required in the request body: an explicit ``null`` or ``[]`` clears it
+    (opting the terminal back out of discovery), while omitting the field
+    entirely is rejected with 422 rather than silently clearing it.
+    """
+    try:
+        updated = await asyncio.to_thread(terminal_service.update_group, terminal_id, body.group)
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal group: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
+async def update_terminal_metadata_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateMetadataBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's free-form metadata dict (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool
+    (as well as by any other authorized API caller).
+    """
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_metadata, terminal_id, body.metadata
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal metadata: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/siblings")
+async def list_terminal_siblings(
+    terminal_id: TerminalId,
+    depth: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "How many leading elements of this terminal's own group to match "
+            "against. Omit for the widest scope this terminal is allowed to "
+            "see (its full own group). Server clamps to at most len(own "
+            "group) — can never exceed it. depth=0 is rejected (422) rather "
+            "than silently reinterpreted as an unscoped, all-terminals query."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
+
+    ``terminal_id`` in the URL IS the caller's resolved identity — the MCP
+    ``list_siblings`` tool passes its own ``CAO_TERMINAL_ID`` here, never a
+    client-supplied "who am I" claim (same mechanism ``send_message``/
+    ``handoff`` already use). This endpoint only ever compares against THAT
+    terminal's own persisted ``group``, so a caller can never request a scope
+    wider than its own group no matter what ``depth`` is passed. A terminal
+    with no ``group`` set finds no siblings — it participates in no
+    discovery — rather than erroring or matching everything.
+    """
+    try:
+        # 404 if the terminal itself doesn't exist, distinct from "exists but
+        # has no group" (empty list result, not an error — #432).
+        await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    try:
+        return await asyncio.to_thread(terminal_service.list_siblings, terminal_id, depth=depth)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list siblings: {str(e)}",
         )
 
 
@@ -2156,6 +2427,7 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            model=body.model,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -2592,6 +2864,28 @@ async def resume_workflow_run_endpoint(
 # which raise KeyError for an unregistered name (mapped to 404 here).
 
 
+async def _project_graph_with_timeout(
+    inst: GraphProvider,
+    filters: Dict[str, Any],
+    *,
+    provider: str,
+    timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
+) -> GraphView:
+    try:
+        return await asyncio.wait_for(inst.project(**filters), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "message": f"graph projection timed out after {timeout_s:g} seconds",
+                "kind": "graph_projection_timeout",
+                "timeout_s": timeout_s,
+                "provider": provider,
+                "metadata": {"graph_projection_timeout": True},
+            },
+        )
+
+
 @app.get("/graph/{provider}")
 async def get_graph_endpoint(
     provider: str,
@@ -2642,7 +2936,7 @@ async def get_graph_endpoint(
             detail=f"unknown graph provider '{provider}'",
         )
     try:
-        view = await inst.project(**filters)
+        view = await _project_graph_with_timeout(inst, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return view.to_dict()
@@ -2679,7 +2973,7 @@ async def export_graph_endpoint(
         )
 
     try:
-        view = await prov.project(**filters)
+        view = await _project_graph_with_timeout(prov, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
